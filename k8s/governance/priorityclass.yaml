@@ -1,0 +1,29 @@
+# ============================================================================
+# PriorityClass —— on-prem AI 平台最經典的面試題
+# ============================================================================
+# 問題：線上 inference 和離線 batch 評估搶同一張卡，怎麼辦？
+# 答案：batch 設低優先級，卡不夠時被搶佔（preempt）。
+#
+# 好消息：這題「單張 GPU 就能真的演」—— 低優先的 Job 佔著卡，
+# 高優先的 Deployment 進來把它踢掉。kubectl get events 看得到 Preempted。
+# ============================================================================
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: inference-critical
+value: 1000000
+globalDefault: false
+preemptionPolicy: PreemptLowerPriority    # 預設值，寫出來是為了讓意圖明確
+description: "線上推論服務。資源不足時可以搶佔低優先級的工作。"
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: batch-best-effort
+value: 100
+globalDefault: false
+# ⚠️ 關鍵：batch 工作自己「不」搶佔別人。
+# 不設這個的話，兩個 batch job 會互相搶佔，變成誰都做不完的活鎖。
+preemptionPolicy: Never
+description: "離線評估與實驗。隨時可以被線上服務踢掉。"

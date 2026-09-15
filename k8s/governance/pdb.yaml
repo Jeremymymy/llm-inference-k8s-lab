@@ -1,0 +1,25 @@
+# ============================================================================
+# PodDisruptionBudget —— 節點維護時的保護傘
+# ============================================================================
+# on-prem 最日常的動作就是節點維護：換硬碟、升 kernel、升 GPU driver。
+# 每一次都要 drain。沒有 PDB 的話，drain 會把 model-server 直接殺掉，
+# 而新 pod 要 3 分鐘才起得來 —— 那就是 3 分鐘的服務中斷。
+#
+# ⚠️ 但 PDB 有個真實的兩難，Phase 0.5 會讓你親眼看到：
+#    單 replica 時 minAvailable: 1 會讓 drain 「永遠卡住」。
+#    因為唯一的 pod 既不能被驅逐，也沒有別的地方可去。
+#    你必須在「維護窗口接受停機」和「多買一張卡」之間選一個。
+#    這個取捨沒有技術解，是預算問題 —— 能講清楚這件事比會寫 YAML 重要。
+# ============================================================================
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: model-server
+  namespace: pricer
+spec:
+  # 用 maxUnavailable 而不是 minAvailable：
+  # 前者跟著 replica 數自動調整，後者是絕對值，replica 一改就要跟著改。
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: model-server

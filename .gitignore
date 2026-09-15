@@ -1,0 +1,24 @@
+# 模型權重與轉檔產物（很大，不進 repo）
+*.gguf
+*.safetensors
+*.bin
+*.pth
+models/
+merged/
+hf-cache/
+
+# 憑證與本機專屬設定（絕不進 repo）
+private/
+kubeconfig*
+
+# 壓測原始輸出（摘要進 RESULTS.md，原始檔不進 repo）
+bench-raw/
+*.jsonl
+
+# Python
+__pycache__/
+.venv/
+*.pyc
+
+# macOS
+.DS_Store

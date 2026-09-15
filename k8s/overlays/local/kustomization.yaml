@@ -1,0 +1,28 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+# 本機（OrbStack，無 GPU）的差異：
+#   - pricer-api 用本機 build 的 image tag
+#   - model-server 的資源調小，避免把 16GB 的 Mac 吃爆
+#
+# 注意 base 裡「沒有」任何 GPU 相關設定 —— GPU 是 gpu overlay 才加的東西。
+# 這樣拆的好處：Phase 0 寫的每一行，Phase 3 都還在用。
+
+images:
+  - name: pricer-api
+    newTag: dev
+
+patches:
+  - target:
+      kind: Deployment
+      name: model-server
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/memory
+        value: 5Gi
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/limits/memory
+        value: 7Gi

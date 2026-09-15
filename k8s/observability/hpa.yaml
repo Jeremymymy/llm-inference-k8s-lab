@@ -1,0 +1,64 @@
+# ============================================================================
+# HPA —— 依「排隊長度」擴縮，不是依 CPU
+# ============================================================================
+# 為什麼不能用 CPU：
+#   LLM 推論的瓶頸是 GPU 或記憶體頻寬，不是 CPU。一個完全飽和、
+#   請求排到天邊的 vLLM pod，它的 CPU 使用率可能只有 20%。
+#   拿 CPU 當訊號 = 永遠不會擴容，然後你在事後檢討為什麼服務掛了。
+#
+# 部署前提：prometheus-adapter 已裝好且
+#   kubectl get --raw /apis/custom.metrics.k8s.io/v1beta1 | grep pricer_requests_waiting
+# 查得到東西。
+# ============================================================================
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: model-server
+  namespace: pricer
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: model-server
+  minReplicas: 1
+  maxReplicas: 4
+
+  metrics:
+    - type: Pods
+      pods:
+        metric:
+          name: pricer_requests_waiting
+        target:
+          type: AverageValue
+          # 平均每個 pod 排隊超過 2 個請求就擴容。
+          # 這個數字沒有標準答案，要靠 Phase 2 的壓測資料回頭校正：
+          # 找出「排隊長度到多少時 p95 延遲開始爆掉」，那就是門檻。
+          averageValue: "2"
+
+  # ------------------------------------------------------------------------
+  # behavior —— 這一段是 LLM 服務的重點，少了它 HPA 會震盪到無法使用
+  # ------------------------------------------------------------------------
+  # 核心問題：控制迴路的延遲遠大於取樣週期。
+  #   HPA 預設每 15 秒評估一次，但新開的 model-server pod 要 1~3 分鐘才 ready。
+  #   如果不設穩定視窗，會發生：
+  #     t=0s   排隊變長 → 擴到 2 個
+  #     t=15s  新 pod 還在載模型，排隊沒變短 → 再擴到 3 個
+  #     t=30s  還是沒變短 → 擴到 4 個（已達上限）
+  #     t=3min 四個 pod 同時 ready，需求早就過了 → 資源浪費 + 之後一路縮回去
+  #   這就是典型的「積分飽和」。解法是讓擴容的觀察窗長過冷啟動時間。
+  behavior:
+    scaleUp:
+      # 至少等 180 秒 —— 必須 >= 冷啟動時間，否則就是上面那個震盪。
+      stabilizationWindowSeconds: 180
+      policies:
+        - type: Pods
+          value: 1               # 一次只加一個，別一口氣開四個
+          periodSeconds: 180
+      selectPolicy: Max
+    scaleDown:
+      # 縮容要更保守：縮錯的代價（再等 3 分鐘冷啟動）遠高於多留一個 pod 的成本。
+      stabilizationWindowSeconds: 600
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 300

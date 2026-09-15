@@ -1,0 +1,27 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: pricer
+
+resources:
+  - namespace.yaml
+  - model-server.yaml
+  - pricer-api.yaml
+
+# 模型座標的唯一來源就是同目錄的 model.conf。
+# Kustomize 直接把它讀成 ConfigMap，所以「改設定」永遠只有一個地方。
+# 換成你自己 fine-tune 的模型時，改那個檔就好，這裡不用動。
+configMapGenerator:
+  - name: model-config
+    envs:
+      - model.conf
+
+# 預設 Kustomize 會在 ConfigMap 名字後面加內容雜湊（例如 model-config-7d9f2k）。
+# 保留這個行為是刻意的：設定一改，Deployment 的 pod template 就跟著變，
+# 於是自動觸發滾動更新。關掉的話，改了 ConfigMap 卻沒有任何 pod 會重讀它。
+generatorOptions:
+  disableNameSuffixHash: false
+
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: pricer-lab

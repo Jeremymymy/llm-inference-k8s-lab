@@ -1,0 +1,97 @@
+# ============================================================================
+# pricer-api —— 對外門面，取代課程裡直接呼叫 Modal 的那段
+# ============================================================================
+# 為什麼要獨立成一個 Deployment 而不是塞進 model-server：
+#   - 兩層的擴縮特性完全不同：應用層輕、秒起；模型層重、要 GPU、起來要幾分鐘
+#   - 應用層改邏輯不該重啟模型層（那要付數分鐘的載入成本）
+#   - 這也讓你在單節點上就能練到 Service DNS 的服務間呼叫
+# ============================================================================
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pricer-api
+automountServiceAccountToken: false
+# 這個服務完全不需要跟 k8s API server 講話。
+# 預設會自動掛一個有效的 token 進每個 pod —— 那是不必要的攻擊面。
+# on-prem 沒有 IRSA 這種雲端身分機制，ServiceAccount + RBAC 就是唯一的隔離手段，
+# 所以「預設關掉、需要才開」在地端比在雲端更重要。
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pricer-api
+  labels:
+    app: pricer-api
+spec:
+  selector:
+    app: pricer-api
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pricer-api
+  labels:
+    app: pricer-api
+spec:
+  replicas: 2          # 應用層很輕，兩個 replica 讓你能真的觀察滾動更新不斷線
+  selector:
+    matchLabels:
+      app: pricer-api
+  template:
+    metadata:
+      labels:
+        app: pricer-api
+    spec:
+      serviceAccountName: pricer-api
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+      containers:
+        - name: api
+          image: pricer-api:dev          # 本機 build，overlay 會覆蓋
+          imagePullPolicy: IfNotPresent   # 本機 build 的 image 不要去 registry 找
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            - name: MODEL_BACKEND
+              # k8s 的 Service DNS。同 namespace 直接用 service 名字就好。
+              # 這取代了課程裡寫死的 http://localhost:11434 那類位址。
+              value: http://model-server:8080
+          envFrom:
+            - configMapRef:
+                name: model-config       # 由 k8s/base/model.conf 產生
+          startupProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 2
+            failureThreshold: 15
+          readinessProbe:
+            # 注意這裡用 /readyz（會去戳後端），跟 liveness 用的 /healthz 不同。
+            # 後端還沒好時，這個 pod 就不該出現在 Service 的 endpoint 裡。
+            httpGet: { path: /readyz, port: http }
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            # 用 /healthz —— 只問「這個行程自己還活著嗎」。
+            # 如果這裡也用 /readyz，後端一重啟就會連帶把整排 API pod 殺光，
+            # 把單一故障放大成連鎖故障。這是很常見的設計錯誤。
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 20
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sh", "-c", "sleep 5"]
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { memory: 256Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]

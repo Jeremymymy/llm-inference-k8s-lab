@@ -1,0 +1,106 @@
+# GPU overlay：把 llama.cpp (CPU) 換成 vLLM (GPU)。
+# 用 strategic merge patch —— container 依 name 合併，所以只要寫要改的欄位。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: model-server
+spec:
+  template:
+    spec:
+      # ------------------------------------------------------------------
+      # GPU 節點必須「兩個都設」：
+      #   toleration  → 讓這個 pod 被允許進入有 taint 的 GPU 節點
+      #   nodeSelector → 讓這個 pod 只想去 GPU 節點
+      # 只設 toleration：GPU pod 可能被排到 CPU 節點上然後失敗
+      # 只設 nodeSelector：一般 pod 也會被排進昂貴的 GPU 節點
+      # ------------------------------------------------------------------
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      nodeSelector:
+        nvidia.com/gpu.present: "true"
+
+      initContainers:
+        # vLLM 直接從 HF Hub 拉權重（有 HF cache 的 PVC 撐著），
+        # 不需要 Phase 0 那個下載 GGUF 的 initContainer。
+        # 這裡只留一個「確認 adapter 在位」的檢查 —— 理由同 Phase 0：
+        # 開不起來的錯誤，好過安靜答錯的錯誤。
+        - name: fetch-base-model
+          image: busybox:1.37
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              if [ ! -d /models/adapter ]; then
+                echo "錯誤：/models/adapter 不存在。" >&2
+                echo "請先把 LoRA adapter 放進 PVC（見 docs/06 Part 3）。" >&2
+                exit 1
+              fi
+              echo "adapter 就緒："; ls -lh /models/adapter/
+
+      containers:
+        - name: llama-server          # 名字沿用 base 的，才能被 strategic merge 命中
+          image: vllm/vllm-openai:latest
+          args:
+            - --model
+            - meta-llama/Llama-3.2-3B
+            - --served-model-name
+            - base
+            - --enable-lora
+            - --lora-modules
+            # ⚠️ 絕對路徑。vLLM 在容器裡吃不到相對路徑，而且是「靜靜失敗」
+            - pricer=/models/adapter
+            # ⚠️ 不設這個的話 adapter(r=256) 會被截斷載入，服務照常跑但答案是錯的
+            - --max-lora-rank
+            - "256"
+            # 本 workload 最大的效能槓桿，見 Phase 2
+            - --max-model-len
+            - "512"
+            # ⚠️ time-slicing 時這個值要除以同卡上的 pod 數，否則第二個 pod 直接 CUDA OOM
+            - --gpu-memory-utilization
+            - "0.85"
+          ports:
+            - name: http
+              containerPort: 8000      # vLLM 預設 8000，llama.cpp 是 8080
+
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+            - name: HF_HOME
+              value: /models/hf
+
+          # vLLM 的啟動比 llama.cpp 慢很多：載權重 + 編 CUDA graph。
+          # 這個數字要用 Phase 1 實際量到的冷啟動時間 × 2 以上。
+          # 90 × 10 = 900 秒。
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 90
+
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 5
+            failureThreshold: 3
+
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 30
+            failureThreshold: 5
+
+          resources:
+            requests:
+              cpu: "2"
+              memory: 8Gi
+              # extended resource 的規則：只能是整數、requests 必須等於 limits、
+              # 不可超賣。這跟 CPU 完全不同。
+              nvidia.com/gpu: "1"
+            limits:
+              memory: 12Gi
+              nvidia.com/gpu: "1"

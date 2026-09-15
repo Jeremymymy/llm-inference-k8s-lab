@@ -1,0 +1,51 @@
+# ============================================================================
+# prometheus-adapter 的 Helm values —— 把 Prometheus 指標變成 k8s 能用的
+# custom metric，這樣 HPA 才能依「排隊長度」而不是 CPU 來擴縮。
+# ============================================================================
+# 安裝：
+#   helm install prometheus-adapter prometheus-community/prometheus-adapter \
+#     -n monitoring -f k8s/observability/prometheus-adapter-values.yaml
+#
+# 為什麼需要這一層：HPA 只認得 metrics.k8s.io（CPU/記憶體）和
+# custom.metrics.k8s.io 這兩個 API。Prometheus 不實作後者，
+# prometheus-adapter 就是那個轉接頭。
+# ============================================================================
+
+prometheus:
+  # 換成你實際的 Prometheus Service。查法：
+  #   kubectl get svc -n monitoring | grep prometheus
+  url: http://monitoring-kube-prometheus-prometheus.monitoring.svc
+  port: 9090
+
+rules:
+  default: false        # 不要那堆預設規則，它們會把 API 塞滿噪音
+  custom:
+    # ------------------------------------------------------------------
+    # 指標一：排隊中的請求數 —— 這才是 LLM 服務該看的擴縮訊號
+    # ------------------------------------------------------------------
+    # llama.cpp 叫 llamacpp:requests_deferred
+    # vLLM   叫 vllm:num_requests_waiting
+    # 兩邊都在這裡對應成同一個 k8s 指標名 pricer_requests_waiting，
+    # 於是 HPA 的設定在 Phase 0（CPU）和 Phase 3（GPU）完全不用改。
+    - seriesQuery: 'llamacpp:requests_deferred{namespace!="",pod!=""}'
+      resources:
+        overrides:
+          namespace: { resource: namespace }
+          pod: { resource: pod }
+      name:
+        matches: "^llamacpp:requests_deferred$"
+        as: "pricer_requests_waiting"
+      metricsQuery: 'avg_over_time(<<.Series>>{<<.LabelMatchers>>}[1m])'
+
+    # ------------------------------------------------------------------
+    # 指標二：正在處理中的請求數（觀察用，不直接拿來擴縮）
+    # ------------------------------------------------------------------
+    - seriesQuery: 'llamacpp:requests_processing{namespace!="",pod!=""}'
+      resources:
+        overrides:
+          namespace: { resource: namespace }
+          pod: { resource: pod }
+      name:
+        matches: "^llamacpp:requests_processing$"
+        as: "pricer_requests_running"
+      metricsQuery: 'avg_over_time(<<.Series>>{<<.LabelMatchers>>}[1m])'

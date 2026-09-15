@@ -1,0 +1,54 @@
+# ============================================================================
+# GPU time-slicing —— 讓一張卡對 k8s 謊報成 N 張
+# ============================================================================
+# 為什麼需要：單張 GPU 讓好幾個 k8s 主題變成無法演練 ——
+#   滾動更新（新 pod 等不到卡，rollout 永遠卡住）
+#   PDB 的正向行為（只有一個 replica 就沒有「預算」可言）
+#   多 replica 的 Service 負載平衡
+# time-slicing 把這些全部解鎖，而且不用多花錢。
+#
+# 為什麼這個 workload 特別適合示範（不是紙上談兵）：
+#   3B bf16 權重約 6~7GB，而 --max-model-len 512 讓 KV cache 幾乎不佔空間。
+#   L4 有 24GB → 跑 2~3 個 replica（每個 --gpu-memory-utilization 0.3）
+#   是真的跑得起來的。
+#
+# ⚠️ 陷阱（面試一定追問，四個都要能講）：
+#   1. 完全沒有記憶體隔離。兩個 pod 共用同一塊 24GB HBM，而 k8s 對此一無所知。
+#      兩個 pod 都用預設的 --gpu-memory-utilization 0.9 → 第二個直接 CUDA OOM。
+#      這是最常見的翻車點。
+#   2. 沒有故障隔離。一個 pod 觸發 XID error，同卡上所有 pod 一起死。
+#   3. nvidia.com/gpu: N 是謊報。scheduler 以為有 N 張卡，
+#      對記憶體壓力毫無感知。這正是 production 要用 MIG 的理由。
+#   4. 效能非線性。context switch 有成本，總吞吐會略降、p99 會明顯惡化。
+#      Phase 3 會把「1 pod 獨佔 vs 2 pod time-sliced」量成一張表。
+#
+# 隔離強度光譜（能講出這個，這題就過了）：
+#   time-slicing（無隔離）
+#     → MPS（記憶體軟上限，仍無錯誤隔離）
+#       → MIG（硬體切分 SM 與記憶體，真正的隔離）
+#         → 整卡獨佔
+#   L4 是 Ada 架構，「不支援 MIG」（只有 A100/H100/H200 那條線有）。
+#   所以本 lab 只能做 time-slicing，MIG 與 MPS 只能讀不能做 —— 誠實寫進 KNOWN-GAPS。
+# ============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: time-slicing-config
+  namespace: gpu-operator
+data:
+  any: |-
+    version: v1
+    flags:
+      migStrategy: none
+    sharing:
+      timeSlicing:
+        # false = 資源名稱維持 nvidia.com/gpu（而不是 nvidia.com/gpu.shared）。
+        # 維持原名的好處是 Deployment 完全不用改就能享受 time-slicing。
+        renameByDefault: false
+        # false = 允許一個容器 request 超過 1 個切片。
+        # 設 true 的話，request 大於 1 會直接失敗 —— 那是比較安全的預設，
+        # 但我們要在單卡上演練多 replica，所以放寬。
+        failRequestsGreaterThanOne: false
+        resources:
+          - name: nvidia.com/gpu
+            replicas: 3        # 一張 L4 → 對 k8s 宣告成 3 張

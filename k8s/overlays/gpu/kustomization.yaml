@@ -1,0 +1,19 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+# Phase 3：同一份 base，只換這一層。
+# base 裡沒有任何 GPU 相關設定 —— overlay 只做「加法」，
+# 這樣本機（沒有 GPU）跟 GPU 機器可以共用同一份 base。
+
+images:
+  - name: pricer-api
+    newTag: dev
+
+patches:
+  - path: model-server-gpu.yaml
+    target:
+      kind: Deployment
+      name: model-server

@@ -1,0 +1,137 @@
+# 實驗數據紀錄
+
+> 邊做邊填。`README.md` 的摘要表從這裡來。
+> **量測規則**：每組跑 3 次取中位數、第一次丟掉（warmup）；一次只改一個變數；正確性與效能必須成對記錄。
+
+---
+
+## 基準線（不是我量的，是對照用的）
+
+來源：Ed Donner 課程 `week7/results.ipynb` 的 leaderboard，同一個模型、同一份測試集。
+
+| 方法 | MAE |
+|---|---|
+| 固定猜平均值 | $106.18 |
+| 人類（課程作者） | $87.62 |
+| XGBoost | $68.23 |
+| 未微調的 Llama 3.2（4-bit） | **$110.72** ← 「LoRA 沒生效」的指紋 |
+| 深度神經網路 | $46.49 |
+| GPT-5.1 | $44.74 |
+| **微調後（要復現的目標）** | **$39.85** |
+
+---
+
+## 正確性
+
+測試集 `ed-donner/items_prompts_full` 的 test split，**size=200**（改了就不可比）。
+
+| # | 日期 | 環境 | 權重精度 | LoRA 方式 | MAE | R² | Hit rate | 備註 |
+|---|---|---|---|---|---|---|---|---|
+| 1 | | Mac / llama.cpp | Q8_0 | GGUF f16 runtime | | | | Phase 0 |
+| 2 | | GPU / vLLM | bf16 | runtime, rank 256 | | | | Phase 1 主線 |
+| 3 | | GPU / vLLM | bf16 | runtime, **預設 rank 16** | | | | 刻意失敗 |
+| 4 | | GPU / vLLM | bf16 | merged | | | | 應與 #2 一致 |
+| 5 | | GPU / vLLM | bf16 | 無（base） | | | | 應接近 $110 |
+| 6 | | GPU / vLLM | **FP8** | runtime, rank 256 | | | | 量化代價 |
+| 7 | | k3s / vLLM | bf16 | runtime, rank 256 | | | | **應與 #2 完全一致** |
+
+**#2 vs #3 的差距** = `--max-lora-rank` 無聲截斷造成的損失：___
+**#2 vs #1 的差距** = Q8_0 量化的代價：___
+**#2 vs #6 的差距** = FP8 量化的代價：___
+
+---
+
+## 效能
+
+g6.xlarge / NVIDIA L4 24GB。工具：`vllm bench serve`，`--random-input-len 150 --random-output-len 5`。
+
+### `--max-model-len` 的影響（最大的槓桿）
+
+| `--max-model-len` | GPU blocks | 飽和吞吐 (req/s) | p50 TTFT | p95 TTFT | p99 TTFT |
+|---|---|---|---|---|---|
+| 131072（預設） | | | | | |
+| 4096 | | | | | |
+| 512 | | | | | |
+
+### request-rate 掃描（找 SLA 轉折點）
+
+| req/s | p50 TTFT | p95 TTFT | **p99 TTFT** | 佇列長度 |
+|---|---|---|---|---|
+| 5 | | | | |
+| 10 | | | | |
+| 20 | | | | |
+| 40 | | | | |
+| 80 | | | | |
+| 160 | | | | |
+
+**p99 開始急遽上翹的點**：___ req/s → 這是實際容量上限，也是 HPA 門檻的依據。
+
+### 量化對照（品質 vs 吞吐）
+
+| 量化 | 顯存佔用 | MAE | 飽和吞吐 | p95 TTFT |
+|---|---|---|---|---|
+| bf16 | | | | |
+| FP8 | | | | |
+| AWQ（選作） | | | | |
+
+### runtime LoRA vs merged（原創實驗，r=256）
+
+| 方式 | MAE | 飽和吞吐 | p95 TTFT | 可熱插拔 |
+|---|---|---|---|---|
+| runtime LoRA | | | | ✅ |
+| merged | | | | ❌ |
+
+### 多 LoRA 同時服務
+
+| 情境 | 吞吐 | p95 TTFT |
+|---|---|---|
+| 1 個 adapter | | |
+| 2 個 adapter（流量各半） | | |
+
+---
+
+## GPU time-slicing 的代價
+
+| 設定 | 吞吐 (req/s) | p50 TTFT | **p99 TTFT** | MAE | 顯存/pod |
+|---|---|---|---|---|---|
+| 1 pod 獨佔 | | | | | |
+| 2 pod time-sliced | | | | | |
+| 3 pod time-sliced | | | | | |
+
+**結論**：___
+
+---
+
+## GPU 真實利用率（DCGM）
+
+壓測飽和時同時量測：
+
+| 指標 | 數值 | 意義 |
+|---|---|---|
+| `DCGM_FI_DEV_GPU_UTIL` | | 「有 kernel 在跑」—— **會騙人** |
+| `DCGM_FI_PROF_SM_ACTIVE` | | SM 真實佔用率 |
+| `DCGM_FI_PROF_PIPE_TENSOR_ACTIVE` | | Tensor Core 使用率 |
+
+**GPU_UTIL 與 SM_ACTIVE 的落差**：___
+**這代表**：___
+
+---
+
+## 關鍵時間數字
+
+| 項目 | 數值 | 用在哪 |
+|---|---|---|
+| llama.cpp 冷啟動（Mac，CPU） | | Phase 0 的 `startupProbe` |
+| vLLM 冷啟動（含權重下載） | | |
+| vLLM 冷啟動（權重已快取） | | **Phase 3 的 `startupProbe` 與 HPA 穩定視窗** |
+| 單卡滾動更新的停機時間 | | 「該不該多買一張卡」的決策依據 |
+
+---
+
+## 成本紀錄
+
+| 日期 | 階段 | 機器時數 | 花費 | 累計 |
+|---|---|---|---|---|
+| | | | | |
+
+**預算上限：$80（月預算警示）**

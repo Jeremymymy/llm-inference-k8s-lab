@@ -1,0 +1,51 @@
+# ============================================================================
+# 離線評估 Job —— 同時示範 Job 語義與「被搶佔的低優先工作」
+# ============================================================================
+# 這個 Job 刻意用 batch-best-effort 優先級。Phase 0.5 會讓它先佔住資源，
+# 再讓高優先的 model-server 進來把它踢掉，然後在事件裡看到 Preempted。
+#
+# 真正的 MAE 量測還是用本機的 eval/measure.py（它要 datasets 套件，
+# 包成 image 不划算）。這個 Job 的重點是 k8s 的 Job 機制本身。
+# ============================================================================
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: batch-eval
+  namespace: pricer
+spec:
+  # completions / parallelism：把 60 次評估切成 3 條平行做完。
+  # 這是 Job 相對於「自己寫迴圈」的價值 —— 分片與重試由 k8s 管。
+  completions: 60
+  parallelism: 3
+
+  backoffLimit: 4              # 整個 Job 最多容忍 4 次 pod 失敗才放棄
+  activeDeadlineSeconds: 1800  # 跑超過 30 分鐘就砍掉，避免卡住的 Job 佔資源不放
+  ttlSecondsAfterFinished: 600 # 完成 10 分鐘後自動清掉，不然 Job 物件會越積越多
+
+  template:
+    spec:
+      restartPolicy: Never
+      priorityClassName: batch-best-effort    # ← 低優先，可被搶佔
+      containers:
+        - name: probe
+          image: curlimages/curl:8.11.1
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              # 刻意跑慢一點，讓你有時間觀察搶佔發生
+              for i in $(seq 1 20); do
+                curl -sf -m 30 -o /dev/null \
+                  -X POST http://pricer-api:8000/price \
+                  -H 'Content-Type: application/json' \
+                  -d '{"description":"Title: Batch Eval Item\nCategory: Tools\nBrand: Test\nDescription: A test item.\nDetails: For batch evaluation."}'
+                sleep 3
+              done
+              echo "分片完成"
+          resources:
+            requests:
+              cpu: 200m
+              memory: 128Mi
+            limits:
+              memory: 256Mi

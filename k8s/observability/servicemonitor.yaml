@@ -1,0 +1,28 @@
+# ============================================================================
+# ServiceMonitor —— 告訴 Prometheus 去哪裡抓指標
+# ============================================================================
+# 為什麼不是直接改 Prometheus 的設定檔：
+#   kube-prometheus-stack 用 Prometheus Operator，抓取目標是用 CRD 宣告的。
+#   好處是「誰要被監控」跟服務本身放在一起、由同一份 manifest 管理，
+#   而不是集中在一份會越長越大、誰都不敢改的 prometheus.yml。
+# ============================================================================
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: model-server
+  namespace: pricer
+  labels:
+    # ⚠️ 最常見的「ServiceMonitor 建了但 Prometheus 沒抓」原因就是這個 label。
+    #    kube-prometheus-stack 預設只認 release 名稱等於自己的 ServiceMonitor。
+    #    用這個指令查你的實際值：
+    #      kubectl get prometheus -A -o jsonpath='{.items[0].spec.serviceMonitorSelector}'
+    release: monitoring
+spec:
+  selector:
+    matchLabels:
+      app: model-server        # 對應 Service 的 labels，不是 Deployment 的
+  endpoints:
+    - port: http               # 這裡填的是 Service 裡「port 的名字」，不是號碼。
+                               # 這也是為什麼 Service 的 port 一定要命名。
+      path: /metrics
+      interval: 15s

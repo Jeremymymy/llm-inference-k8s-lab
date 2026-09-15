@@ -1,0 +1,29 @@
+# kind 三節點叢集 —— Phase 0.5 用
+#
+# 為什麼要三個節點：單節點會給你三個錯誤直覺
+#   1. ReadWriteOnce 的 PVC「看起來」可以被多 pod 共掛（因為都在同一節點）
+#   2. topologySpreadConstraints / anti-affinity 只能練「排不進去」
+#   3. drain 會清空整個叢集，練不到真實的節點維護
+#
+# 為什麼只有三個：16GB 的 Mac，每個節點是一個容器，空載約 500MB。
+# 三個（一 control-plane + 兩 worker）是能練到多節點語義的最小值。
+# ⚠️ 開這個之前先 `orb stop k8s`，不要同時開兩個叢集。
+apiVersion: kind.x-k8s.io/v1alpha4
+kind: Cluster
+name: pricer-lab
+nodes:
+  - role: control-plane
+  - role: worker
+    labels:
+      # 假裝這台是 GPU 節點。Phase 0.5 用假的 extended resource 在上面
+      # 練排程語義，完全不需要真的 GPU。
+      node-role.pricer/gpu: "true"
+  - role: worker
+    labels:
+      node-role.pricer/gpu: "false"
+
+# 預設的 kindnet CNI 「不會」強制執行 NetworkPolicy。
+# 要練 NetworkPolicy 的話把下面兩行取消註解，再手動裝 Calico：
+#   kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.29.1/manifests/calico.yaml
+# networking:
+#   disableDefaultCNI: true

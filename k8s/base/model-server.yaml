@@ -1,0 +1,208 @@
+# ============================================================================
+# model-server —— 真正做推論的那一層
+# ============================================================================
+# base 版用 llama.cpp server（CPU，本機跑）。Phase 3 的 gpu overlay 會把
+# image 與 args 換成 vLLM。介面兩邊都是 OpenAI 相容的 /v1/completions，
+# 所以上游的 pricer-api 一行都不用改 —— 這就是選 llama.cpp 而不是 Ollama
+# 當替身的理由之一（另一個理由是 llama.cpp 有 Prometheus /metrics）。
+# ============================================================================
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: model-weights
+spec:
+  accessModes:
+    - ReadWriteOnce          # 注意：單節點上這會「看起來」可以被多個 pod 共掛。
+                             # 那是假象，Phase 0.5 會刻意重現真實叢集的 Multi-Attach 失敗。
+  resources:
+    requests:
+      storage: 20Gi
+  # 故意不寫 storageClassName，用叢集預設。
+  # 寫死 class 名稱是最常見的「在我機器上可以跑」來源。
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: model-server
+  labels:
+    app: model-server
+spec:
+  selector:
+    app: model-server
+  ports:
+    - name: http           # 名字很重要：ServiceMonitor 靠 port 名稱來抓 metrics
+      port: 8080
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: model-server
+  labels:
+    app: model-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: model-server
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1          # 先開新的再關舊的 —— 因為啟動要好幾分鐘，
+      maxUnavailable: 0    # 不這樣設的話每次更新都會有數分鐘的完全斷線。
+                           # ⚠️ 到了 Phase 3 只有一張 GPU 時，這個設定會讓
+                           #    rollout 永遠卡住（新 pod 等不到卡）。見 06 的討論。
+  template:
+    metadata:
+      labels:
+        app: model-server
+    spec:
+      # 生成中的請求不該被 SIGTERM 直接砍斷。
+      # 這個值必須 > 最長的一次生成時間。
+      terminationGracePeriodSeconds: 60
+      automountServiceAccountToken: false   # 這個 pod 不需要跟 API server 講話
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001                       # 讓非 root 使用者寫得進 PVC
+
+      initContainers:
+        # ------------------------------------------------------------------
+        # 為什麼用 initContainer 而不是把模型烤進 image：
+        #   1. 模型跟程式碼的生命週期不同 —— 換 adapter 不該重 build image
+        #   2. image 會變成好幾 GB，每個節點都要 pull 一次
+        #   3. 同一個 image 可以服務不同模型（靠 ConfigMap 換座標）
+        # 代價：pod 啟動變慢、且依賴外部網路。Phase 0.5 會討論 on-prem 的
+        # 真實做法（內部物件儲存 / 預先 rsync 到 local PV / RWX 共享）。
+        # ------------------------------------------------------------------
+        - name: fetch-base-model
+          image: curlimages/curl:8.11.1
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              if [ -f /models/base.gguf ]; then
+                echo "base.gguf 已存在，跳過下載"
+              else
+                echo "下載 base model（約 3.4GB，第一次會很久）…"
+                curl -fL --retry 3 --retry-delay 5 \
+                  -o /models/base.gguf.partial \
+                  "https://huggingface.co/QuantFactory/Llama-3.2-3B-GGUF/resolve/main/Llama-3.2-3B.Q8_0.gguf"
+                mv /models/base.gguf.partial /models/base.gguf
+              fi
+
+              # LoRA adapter 是你在本機轉出來的，要自己放進 PVC（見 docs/02 的說明）。
+              # 這裡刻意「找不到就失敗」而不是靜靜地跳過 —— 沒有 adapter 的話
+              # 服務會正常起來但估價全錯（MAE 約 $110 而不是 $40），
+              # 那種安靜的錯誤比開不起來難查十倍。
+              if [ ! -f /models/pricer-lora.gguf ]; then
+                echo "錯誤：/models/pricer-lora.gguf 不存在。" >&2
+                echo "請先照 docs/02-phase0-local-k8s.md 的 Part 1 產生並複製進 PVC。" >&2
+                exit 1
+              fi
+              echo "模型檔就緒："
+              ls -lh /models/
+          volumeMounts:
+            - name: models
+              mountPath: /models
+
+      containers:
+        - name: llama-server
+          image: ghcr.io/ggml-org/llama.cpp:server
+          args:
+            - --model
+            - /models/base.gguf
+            - --lora
+            - /models/pricer-lora.gguf
+            - --host
+            - 0.0.0.0
+            - --port
+            - "8080"
+            # ⚠️ llama.cpp 的 --ctx-size 是「所有並行槽位共用的總量」，
+            #    會被 --parallel 均分。4 個槽位各需約 512 → 總共要 2048。
+            #    設太小的症狀是長一點的 prompt 被無聲截斷、估價變差。
+            - --ctx-size
+            - "2048"
+            - --parallel
+            - "4"
+            - --metrics        # 開啟 /metrics（Prometheus 格式），預設是關的
+          ports:
+            - name: http
+              containerPort: 8080
+
+          # ------------------------------------------------------------------
+          # 三種 probe 的分工 —— 這是 LLM 服務最容易做錯的地方
+          # ------------------------------------------------------------------
+          # startupProbe：吸收「啟動很慢」這件事。在它通過之前，
+          #   liveness 與 readiness 都不會執行。
+          #   容忍時間 = failureThreshold × periodSeconds = 60 × 10 = 600 秒。
+          #   本機 CPU 載 3B 大約 30~90 秒，但第一次還要下載模型，所以抓寬。
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 60
+
+          # readinessProbe：控制「要不要把流量送進來」。
+          #   失敗只會把 pod 從 Service 的 endpoint 拿掉，不會重啟它。
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 3
+
+          # livenessProbe：只負責抓「行程還在但已經死當」。
+          #   閾值要比 readiness 寬鬆很多 —— 它一失敗就是重啟，
+          #   而重啟要付出好幾分鐘的載入成本。設太敏感會造成重啟風暴。
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 30
+            failureThreshold: 5
+
+          lifecycle:
+            preStop:
+              exec:
+                # 為什麼需要這個 sleep：
+                # pod 被刪除時，「從 endpoint 移除」和「送 SIGTERM」是
+                # 兩條平行的非同步流程，沒有先後保證。kube-proxy 更新
+                # iptables 需要時間，這段期間新請求還會被送到這個 pod。
+                # 先睡幾秒讓 endpoint 傳播完成，再開始關閉，才不會掉請求。
+                command: ["sh", "-c", "sleep 10"]
+
+          resources:
+            requests:
+              cpu: "2"
+              memory: 6Gi
+            limits:
+              # 不設 CPU limit：CPU 是可壓縮資源，設了只會在尖峰被 throttle，
+              # 對延遲敏感的推論服務反而有害。
+              memory: 8Gi
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+
+          volumeMounts:
+            - name: models
+              mountPath: /models
+            - name: dshm
+              mountPath: /dev/shm
+
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: model-weights
+        - name: dshm
+          # k8s 預設只給 /dev/shm 64MB。llama.cpp 在 CPU 上還撐得住，
+          # 但 Phase 3 換成 vLLM 之後一定會 crash。現在就放著，
+          # 讓 base 在兩個 Phase 都能用。
+          emptyDir:
+            medium: Memory
+            sizeLimit: 2Gi
