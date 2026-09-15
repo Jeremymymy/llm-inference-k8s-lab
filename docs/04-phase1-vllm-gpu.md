@@ -123,8 +123,7 @@ ssh -i <key> -L 8000:localhost:8000 ubuntu@<公有IP>
 nvidia-smi                      # 確認看得到 L4
 df -h /                         # 確認磁碟空間
 
-# 把 HF cache 指到有空間的地方
-echo 'export HF_HOME=/opt/dlami/nvme/hf' >> ~/.bashrc 2>/dev/null || \
+# 把 HF cache 放在 EBS root volume 上（見下方說明，別放 instance store）
 echo 'export HF_HOME=$HOME/hf-cache' >> ~/.bashrc
 source ~/.bashrc
 mkdir -p "$HF_HOME"
@@ -137,6 +136,19 @@ export HF_TOKEN=$(cat ~/private/hf-token)
 ```
 
 ### 2.2 為什麼 HF cache 的位置很重要
+
+g6.xlarge 有**兩種**磁碟，選錯的代價是每天重下載 6.4GB：
+
+| 磁碟 | 路徑 | `stop` 之後 | 速度 |
+|---|---|---|---|
+| **EBS root volume**（我們掛的 150GB gp3） | `/`、`$HOME` | ✅ **保留** | 快 |
+| **Instance store**（機型自帶的 250GB NVMe） | `/opt/dlami/nvme` 之類 | ❌ **全部消失** | 更快 |
+
+⚠️ **Instance store 是跟實體主機綁在一起的。** 你 `stop` 再 `start`，AWS 會把你的機器放到另一台實體主機上 —— 那顆 NVMe 上的東西全沒了。
+
+我們的流程是每天收工 `stop` 省錢，所以 **HF cache 必須放 EBS**（`$HOME/hf-cache`）。放 instance store 的話，每天早上都要重新下載 6.4GB 權重。
+
+Instance store 適合放的是**真正的暫存**：壓測的原始輸出、編譯中間檔 —— 丟了也無所謂、而且要快的東西。
 
 模型下載一次要幾分鐘。如果 cache 放在**會隨容器消失**的地方，你每次 `docker run` 都要重下載一次 —— 在按小時計費的機器上，這是純粹的浪費。
 

@@ -128,10 +128,12 @@ aws elbv2 describe-load-balancers --region "$R" \
 
 ## stop / terminate / delete 的差別
 
-| 動作 | EC2 實例 | EBS | 資料 | 何時用 |
+| 動作 | EC2 實例 | EBS root volume | **Instance store**（機型自帶的 NVMe） | 何時用 |
 |---|---|---|---|---|
-| **stop** | 停止計費 | **繼續計費**（約 $12/月） | 保留 | 每天收工 |
-| **terminate** | 消失 | 隨之刪除（若 `DeleteOnTermination=true`） | **消失** | 整個階段做完、數據已抓回本機 |
+| **stop** | 停止計費 | **繼續計費**（約 $12/月），資料保留 | ⚠️ **資料全部消失** | 每天收工 |
+| **terminate** | 消失 | 隨之刪除（若 `DeleteOnTermination=true`） | 消失 | 整個階段做完、數據已抓回本機 |
+
+⚠️ **Instance store 連 `stop` 都保不住。** 它綁在實體主機上，`start` 之後你會被放到另一台機器。所以 HF cache、benchmark 結果這些都要放 EBS（`$HOME` 底下），instance store 只放丟了也無所謂的暫存。
 
 **stop 是日常，terminate 是收工。** 在 terminate 之前一定要先把 benchmark 數據 `scp` 回本機 —— 機器刪了就沒了。
 
