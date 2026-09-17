@@ -1,6 +1,6 @@
 # LLM Inference on Kubernetes 實驗室 — 06：Phase 3，GPU 上的 Kubernetes
 
-> 成本：**約 $12**（同一台 g6.xlarge，再跑 15 小時）。**不開 EKS，所以沒有額外的控制平面費用。**
+> 成本：**約 $12**（同一台 g6.xlarge，再累積開機 15 小時）。**不開 EKS，所以沒有額外的控制平面費用。**
 > 產出：Phase 0/0.5 的 k8s 成果接上真 GPU，加上三個只有真 GPU 才做得到的實驗。
 
 ---

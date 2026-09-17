@@ -97,9 +97,15 @@ Console → **Billing and Cost Management → Budgets → Create budget**
 | `lab-monthly-hard` | Cost budget（月） | $80 | 實際 50% / 80% / 100% 都寄信 |
 | `lab-daily-canary` | Cost budget（日） | $5 | 實際 100% 寄信 |
 
+**兩個都不要加 filter** —— 範圍保持預設的「全部服務、全部 region」，建立精靈裡的 Filters 一律不要動。
+
 ### 2.2 為什麼這樣做
 
 月預算抓不到「忘記關機」—— 等你收到 80% 警示時，錢已經花掉了。**日預算才是真正的煙霧偵測器**：正常使用一天不會超過 $5，一收到日警示就代表有東西忘了關。
+
+**不加 filter 的理由**：偵測器不該預先假設火從哪裡燒起來。如果把範圍限縮成 `Service = EC2`，那 EKS 控制平面（$73/月）、S3、CloudWatch logs、跨區流量全部逃過警示 —— 而這些正是你「不知道自己開了」的東西。會咬人的一定是你沒預期到的那一項。
+
+唯一的例外：這個 AWS 帳號同時有 lab 以外的支出，$5/日 的基線就不成立。解法是改用 lab 專用帳號，而不是加 filter 讓警示變半盲。
 
 ### 2.3 驗證
 
