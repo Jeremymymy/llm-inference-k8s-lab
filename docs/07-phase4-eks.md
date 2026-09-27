@@ -33,7 +33,7 @@
 
 | EKS / 雲端 | on-prem 的對應 | 差異在哪 |
 |---|---|---|
-| **AWS Load Balancer Controller**（Service type=LoadBalancer 自動開 ALB/NLB） | **MetalLB** + ingress-nginx | MetalLB 的 L2 模式**不是負載平衡，是故障轉移** —— 所有流量經過一個節點。要真正水平擴展得用 BGP 模式，而那需要網路團隊配合 |
+| **AWS Load Balancer Controller**（Service type=LoadBalancer 自動開 ALB/NLB） | **MetalLB** + Gateway API 實作（例如 Envoy Gateway） | MetalLB 的 L2 模式**不是負載平衡，是故障轉移** —— 所有流量經過一個節點。要真正水平擴展得用 BGP 模式，而那需要網路團隊配合。L7 那層別再選 ingress-nginx：它已於 2026-03 退役（本 lab Phase 0 用它只為了簡便） |
 | VPC CNI（pod 拿 VPC IP） | Calico / Cilium（overlay 或 BGP） | 地端要自己決定 overlay vs underlay，以及 MTU |
 | Security Group for pods | NetworkPolicy | 地端只有 NetworkPolicy，而且**要確認 CNI 真的會執行它** |
 | Route 53 | CoreDNS + 內部 DNS | |

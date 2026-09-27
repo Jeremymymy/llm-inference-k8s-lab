@@ -3,8 +3,10 @@
 # ============================================================================
 # base 版用 llama.cpp server（CPU，本機跑）。Phase 3 的 gpu overlay 會把
 # image 與 args 換成 vLLM。介面兩邊都是 OpenAI 相容的 /v1/completions，
-# 所以上游的 pricer-api 一行都不用改 —— 這就是選 llama.cpp 而不是 Ollama
-# 當替身的理由之一（另一個理由是 llama.cpp 有 Prometheus /metrics）。
+# 所以上游的 pricer-api 一行都不用改。
+# 選 llama.cpp 而不是 Ollama 當替身，關鍵在 /metrics 的指標語意
+# （處理中 / 排隊中的請求數）跟 vLLM 對得上；--lora 直接掛 adapter
+# 的方式也跟 vLLM 一致。理由見 docs/02 的「為什麼要 --metrics」。
 # ============================================================================
 ---
 apiVersion: v1
@@ -99,7 +101,7 @@ spec:
               # 那種安靜的錯誤比開不起來難查十倍。
               if [ ! -f /models/pricer-lora.gguf ]; then
                 echo "錯誤：/models/pricer-lora.gguf 不存在。" >&2
-                echo "請先照 docs/02-phase0-local-k8s.md 的 Part 1 產生並複製進 PVC。" >&2
+                echo "請先照 docs/02-phase0-local-k8s.md 的 Part 1 產生、Part 3 複製進 PVC。" >&2
                 exit 1
               fi
               echo "模型檔就緒："
@@ -128,6 +130,11 @@ spec:
             - --parallel
             - "4"
             - --metrics        # 開啟 /metrics（Prometheus 格式），預設是關的
+            # ⚠️ llama-server 預設用最多 8192 MiB RAM 快取 prompt，隨請求增長、
+            #    不會釋放。本機實測壓測期間 4.3→6.5 GiB，把 8 GiB 的 VM 擠到 OOM。
+            #    估價的 prompt 幾乎不重複，快取沒有收益，直接關掉。
+            - --cache-ram
+            - "0"
           ports:
             - name: http
               containerPort: 8080
@@ -138,7 +145,8 @@ spec:
           # startupProbe：吸收「啟動很慢」這件事。在它通過之前，
           #   liveness 與 readiness 都不會執行。
           #   容忍時間 = failureThreshold × periodSeconds = 60 × 10 = 600 秒。
-          #   本機 CPU 載 3B 大約 30~90 秒，但第一次還要下載模型，所以抓寬。
+          #   本機 CPU 載 3B 大約 30~90 秒，時間不穩定，所以抓寬。
+          #   下載模型不用算：它在 initContainer，probe 要等主容器啟動後才開始計時。
           startupProbe:
             httpGet:
               path: /health

@@ -27,7 +27,7 @@
 
 | # | 日期 | 環境 | 權重精度 | LoRA 方式 | MAE | R² | Hit rate | 備註 |
 |---|---|---|---|---|---|---|---|---|
-| 1 | | Mac / llama.cpp | Q8_0 | GGUF f16 runtime | | | | Phase 0 |
+| 1 | 2026-09-25 | Mac / llama.cpp | Q8_0 | GGUF f16 runtime | $40.79 | 72.1% | 75.0% | Phase 0；4 次 MAE 完全相同 |
 | 2 | | GPU / vLLM | bf16 | runtime, rank 256 | | | | Phase 1 主線 |
 | 3 | | GPU / vLLM | bf16 | runtime, **預設 rank 16** | | | | 刻意失敗 |
 | 4 | | GPU / vLLM | bf16 | merged | | | | 應與 #2 一致 |
@@ -38,6 +38,17 @@
 **#2 vs #3 的差距** = `--max-lora-rank` 無聲截斷造成的損失：___
 **#2 vs #1 的差距** = Q8_0 量化的代價：___
 **#2 vs #6 的差距** = FP8 量化的代價：___
+
+---
+
+## 本機 HPA 壓測（Phase 0）
+
+Mac / OrbStack（VM 8 GiB）/ llama.cpp Q8_0 + LoRA，`--parallel 4`。`eval/measure.py --size 200 --workers 30`，打 model-server Service（docs/02 9.4）。**各跑一次，未照 3 次取中位數**：這裡驗證的是 HPA 機制，不是效能數字。
+
+| label | MAE | R² | Hit rate | p50 (ms) | p95 (ms) | req/s | 備註 |
+|---|---|---|---|---|---|---|---|
+| hpa-load-test | $41.49 | 71.5% | 74.5% | 30123 | 59212 | 0.8 | 2026-09-27；prompt cache 開著（預設 8 GiB），model-server 4.3→6.5 GiB，VM System OOM 砍 grafana；p95 可能被記憶體壓力拖慢 |
+| hpa-load-test-cache-ram-0 | $40.86 | 71.9% | 75.0% | 31913 | 37582 | 0.9 | 2026-09-27；`--cache-ram 0`，高峰 4.66 GiB、無 OOM。兩次都有 `SuccessfulRescale` → 2，第二個 pod `Insufficient memory` Pending |
 
 ---
 
@@ -121,7 +132,7 @@ g6.xlarge / NVIDIA L4 24GB。工具：`vllm bench serve`，`--random-input-len 1
 
 | 項目 | 數值 | 用在哪 |
 |---|---|---|
-| llama.cpp 冷啟動（Mac，CPU） | | Phase 0 的 `startupProbe` |
+| llama.cpp 冷啟動（Mac，CPU） | 約 70 秒（權重已在 PVC；2026-09-27 rollout 實測，建立→ready） | Phase 0 的 `startupProbe` |
 | vLLM 冷啟動（含權重下載） | | |
 | vLLM 冷啟動（權重已快取） | | **Phase 3 的 `startupProbe` 與 HPA 穩定視窗** |
 | 單卡滾動更新的停機時間 | | 「該不該多買一張卡」的決策依據 |

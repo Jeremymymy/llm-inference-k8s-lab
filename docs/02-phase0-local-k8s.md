@@ -49,7 +49,7 @@ Phase 0（這裡，$0）        Phase 3（GPU）
 
 ```bash
 cd ~/Desktop/side-projects/llm-inference-k8s-lab
-set -a; . k8s/base/model.conf; set +a
+while IFS='=' read -r k v; do export "$k=$v"; done < <(grep -E '^[A-Z_]+=' k8s/base/model.conf)
 mkdir -p models
 ```
 
@@ -130,7 +130,7 @@ Q8_0 幾乎無損。這一步的目的是建立**正確性基準**，要把「�
 ⚠️ llama.cpp 的 `--ctx-size` 是**所有並行槽位共用的總量**，會被 `--parallel` 均分。4 個槽位、每個需要約 512 → 總共要 2048。設成 512 配 4 個槽位的話，每個槽位只剩 128，長一點的 prompt 會被**無聲截斷**，症狀是 MAE 莫名其妙變差而且沒有任何錯誤訊息。
 
 **為什麼要 `--metrics`**
-llama.cpp 的 Prometheus 端點預設是**關的**。這是選它而不是 Ollama 當本機替身的關鍵理由 —— Ollama 沒有 `/metrics`，用它的話 Part 8 的整套可觀測性就得延到 GPU 階段才能做，而那是最花時間試錯的部分。
+llama.cpp 的 Prometheus 端點預設是**關的**。這是選它而不是 Ollama 當本機替身的關鍵理由 —— llama.cpp 的指標語意（處理中 / 排隊中的請求數）跟 vLLM 對得上，Part 8 的整套可觀測性（ServiceMonitor、custom metrics HPA）可以在本機先做完。Ollama 長期沒有原生 `/metrics`（2026 年才有 PR 在補），指標名稱也跟 vLLM 不同；用它的話這部分就得延到 GPU 階段才能做，而那是最花時間試錯的部分。
 
 ### 1.3 驗證
 
@@ -316,11 +316,18 @@ livenessProbe:                   # 「它是不是死當了」
   failureThreshold: 5
 ```
 
-部署並觀察：
+部署並觀察。overlay 裡也包含 pricer-api（Part 6 才細講），它的 image 要先在本機 build，否則會卡在 `ImagePullBackOff`：
 
 ```bash
+docker build -t pricer-api:dev src/pricer-api
 kubectl apply -k k8s/overlays/local
 kubectl -n pricer get pods -w
+```
+
+model-server 第一次啟動會在 initContainer 下載 base model（約 3.4GB，視網速 10–20 分鐘）。curl 的進度條用 `\r` 覆寫同一行，`kubectl logs` / k9s 只會顯示一行 `0` 看起來像卡住，要這樣看：
+
+```bash
+kubectl -n pricer logs deploy/model-server -c fetch-base-model | tr '\r' '\n' | tail -1
 ```
 
 ### 4.2 為什麼這樣做
@@ -339,7 +346,7 @@ kubectl -n pricer get pods -w
 60 × 10s = 600 秒
 ```
 
-本機 CPU 載 3B 大約 30–90 秒，但第一次還要下載 3.4GB 的 base model，所以抓寬。Phase 3 用 vLLM 時要重新估（vLLM 還要編 CUDA graph）。
+本機 CPU 載 3B 大約 30–90 秒（實測約 70 秒），時間不穩定，所以抓寬。**下載 base model 的時間不用算進去**：它發生在 initContainer，probe 要等所有 initContainer 跑完、主容器啟動後才開始計時。Phase 3 用 vLLM 時要重新估（vLLM 還要編 CUDA graph）。
 
 ### 4.3 驗證
 
@@ -415,20 +422,25 @@ grace period > preStop 的 sleep + 最長的一次生成時間 + 緩衝
 ### 5.4 驗證
 
 ```bash
-# 一邊持續打請求
+# 一邊持續打請求（OrbStack 讓 Mac 直接解析 Service DNS，流量走 Service 分流）
 while true; do
   curl -s -o /dev/null -w "%{http_code} " \
-    http://localhost:8000/price -X POST \
+    http://pricer-api.pricer.svc.cluster.local:8000/price -X POST \
     -H 'Content-Type: application/json' \
     -d '{"description":"Title: Test\nCategory: Tools"}'
   sleep 0.2
 done
 
-# 另一個終端刪 pod
-kubectl -n pricer delete pod -l app=pricer-api --wait=false
+# 另一個終端只刪「一個」pod，另一個 replica 繼續接流量
+kubectl -n pricer delete $(kubectl -n pricer get pod -l app=pricer-api -o name | head -1) --wait=false
 ```
 
 **成功條件：全程只看到 `200`，沒有任何 `000`（連線中斷）或 `502` / `503`。**
+
+兩個容易做錯、而且錯了會看到 `000` 但跟 preStop 無關的地方：
+
+- **不要用 `-l app=pricer-api` 一次刪全部。** 兩個舊 pod 同時從 endpoint 移除，新 pod 還沒通過 readiness，中間會有幾秒「沒有任何 pod 可接」的空窗。preStop 只保證「已送進來的請求做完」，填不了這個洞。要換掉全部 pod 請用 `rollout restart`（Part 11）。
+- **不要用 `port-forward`。** `kubectl port-forward svc/...` 其實只綁定其中一個 pod，不經過 Service 分流；那個 pod 被刪，轉發就斷了。
 
 想看到失敗的樣子？把 `preStop` 拿掉再做一次，你會看到零星的連線錯誤。**建議真的做一次這個對照** —— 親眼看過之後，這個設定就不會再忘記。
 
@@ -440,11 +452,11 @@ kubectl -n pricer delete pod -l app=pricer-api --wait=false
 
 ### 6.1 做法
 
+image 已在 Part 4.1 build 過。之後改了 `app.py` 才需要重 build，並重啟 pod 讓它吃到新 image（tag 沒變，`IfNotPresent` 不會自己換）：
+
 ```bash
-cd src/pricer-api
-docker build -t pricer-api:dev .
-cd ../..
-kubectl apply -k k8s/overlays/local
+docker build -t pricer-api:dev src/pricer-api
+kubectl -n pricer rollout restart deploy/pricer-api
 ```
 
 ### 6.2 為什麼要獨立一層
@@ -559,7 +571,11 @@ curl -s http://pricer.k8s.orb.local/price -X POST \
 
 **更深一層**：LLM 的長連線讓 L7 負載平衡器的基本假設失效。傳統 LB 假設連線短、可以用連線數做負載平衡。LLM 的連線可能持續數分鐘，一個「連線數最少」的 pod 可能正在處理最重的請求。這是為什麼 LLM 網關（Envoy AI Gateway、vLLM 的 router）會用 KV cache 使用率之類的指標做路由，而不是連線數。
 
-**Gateway API 呢？** 它解決了 Ingress 的 annotation 地獄（timeout、retry 變成一等公民的 API 欄位，而不是廠商各自定義的字串）。能講出這一點就夠了，本 lab 不實作 —— 在 on-prem 場景裡 ingress-nginx 仍是絕對主流。
+**Gateway API 呢？** Ingress 當然也能設 timeout，但 Ingress API 本身沒有這個欄位，只能靠廠商各自定義的 annotation 字串（上面那三行就是）：換 controller 要全部重寫、值寫錯 `apply` 也不會報錯。Gateway API 把 timeout 做成 HTTPRoute 的正式欄位（`timeouts.request`），所有實作照同一份規格；retry 截至 v1.6 仍在往標準推進中。
+
+再往上一層是 **Gateway API Inference Extension**（llm-d 建立在它之上）：用 `InferencePool` + Endpoint Picker，依各 pod 的佇列長度、KV cache、已載入的 LoRA 決定請求送哪個 pod —— 解決的是「LLM-aware 路由」，不是 annotation 問題，而且它需要 Gateway API 當地基。
+
+⚠️ **ingress-nginx 已於 2026-03 退役**（不再有任何修補，含安全漏洞），官方建議遷移到 Gateway API。本 lab 仍用它，只因為它最簡單、教材最多，拿來練 Ingress 概念夠用；不要把它帶進正式環境。
 
 ### ⚠️ 陷阱
 
@@ -692,7 +708,11 @@ kubectl -n pricer get hpa model-server -w
 ```yaml
 behavior:
   scaleUp:
-    stabilizationWindowSeconds: 180
+    stabilizationWindowSeconds: 180   # 窗口過濾尖峰
+    policies:
+      - type: Pods
+        value: 1                      # policy 限制速度：
+        periodSeconds: 180            #   任何 180 秒內最多 +1
 ```
 
 **核心問題：控制迴路的延遲遠大於取樣週期。**
@@ -706,18 +726,23 @@ t=30s   還是沒變短        → 擴到 4（已達上限）
 t=3min  四個 pod 同時就緒，但需求早就過了 → 浪費 + 接著一路縮回去
 ```
 
-這是控制理論裡的**積分飽和**。解法是讓擴容的觀察窗長過冷啟動時間。
+這是控制理論裡的**積分飽和**。解法分兩層：
+
+- **窗口過濾尖峰**：`stabilizationWindowSeconds` 取窗口內建議值的最小值（縮容取最大值），需求要持續整個窗口才會動，短暫尖峰直接忽略。
+- **policy 限制速度**：`policies` 規定任何 `periodSeconds` 內最多變動 `value` 個 pod。**擋住上面連續擴容的是這一層** —— 光靠窗口不夠：t=180s 擴到 2 之後，窗口內的建議值仍然都 ≥3，下一輪照樣會擴。period 設成 ≥ 冷啟動時間，新 pod ready 之前就不會再加下一個。
 
 **縮容要更保守**（我們設 600 秒），因為縮錯的代價（再等 3 分鐘冷啟動）遠高於多留一個 pod 的成本。
 
-**能講出「因為冷啟動 3 分鐘，所以我把 scaleUp 的穩定視窗設成 180 秒」，比背出 HPA 有哪些欄位有價值得多。**
+**能講出「窗口過濾尖峰；因為冷啟動 3 分鐘，所以 policy 的 period 設成 180 秒、一次只加一個」，比背出 HPA 有哪些欄位有價值得多。**
 
 ### 9.4 驗證
 
 ```bash
-# 製造負載
+# 製造負載 —— 壓測直接打 model-server：measure.py 打的是 /v1/completions，
+# Ingress 後面的 pricer-api 只有 /price，打 pricer.k8s.orb.local 會 404。
+# HPA 看的是 model-server 的排隊長度，繞過 pricer-api 不影響測試。
 uv run --with datasets eval/measure.py \
-  --base-url http://pricer.k8s.orb.local --model pricer \
+  --base-url http://model-server.pricer.svc.cluster.local:8080 --model pricer \
   --size 200 --workers 30 --label "hpa-load-test"
 
 # 另一個終端觀察
@@ -725,7 +750,25 @@ kubectl -n pricer get hpa model-server -w
 kubectl -n pricer describe hpa model-server | tail -20
 ```
 
-成功條件：`describe` 的 Events 裡看到 `SuccessfulRescale`，且 `TARGETS` 欄位顯示的是實際的佇列長度而不是 `<unknown>`。
+成功條件：`describe` 的 Events 裡看到 `SuccessfulRescale`，且 `TARGETS` 欄位顯示的是實際的佇列長度而不是 `<unknown>`。**看到 `SuccessfulRescale` 就算過**，第二個 pod 不需要跑起來。
+
+**預期現象：HPA 觸發了，但 scheduler 放不下。** 新開的 model-server 會一直卡在 `Pending`：
+
+```
+$ kubectl -n pricer get events --field-selector reason=FailedScheduling
+0/1 nodes are available: 1 Insufficient memory.
+```
+
+OrbStack VM 預設 8 GiB，一個 model-server 就 request 5Gi，第二個排不進去。k9s 裡看到 `stream closed: EOF` 是因為容器從沒啟動過、沒有 log，不是崩潰。
+
+這正是要學的：**HPA 只改「期望 replica 數」，它生不出機器。** 容量不夠時 pod 就是 Pending；真實叢集裡補節點的是 Cluster Autoscaler / Karpenter（Phase 4）。
+
+測完把 Pending 的 pod 清掉：
+
+```bash
+kubectl -n pricer delete hpa model-server
+kubectl -n pricer scale deploy/model-server --replicas=1
+```
 
 ### ⚠️ 陷阱
 
@@ -734,7 +777,7 @@ kubectl -n pricer describe hpa model-server | tail -20
   2. Prometheus 裡直接查那個 series 有沒有資料
   3. `kubectl -n monitoring logs deploy/prometheus-adapter` 看 `seriesQuery` 的錯誤
 - **HPA 的 `Pods` 類型指標是「平均每個 pod」**，不是總和。設 `averageValue: 2` 表示「平均每個 pod 排 2 個」，不是「總共排 2 個」。
-- 本機的擴容數字**不要當真**。16GB 的機器跑到 3 個 replica 就會開始 swap，曲線會被本機資源扭曲。這裡只練機制，真實數字到 Phase 3。
+- 本機的擴容數字**不要當真**。OrbStack 預設 8 GiB 的 VM 連第 2 個 replica 都放不下（見 9.4 的預期現象）。這裡只練機制，真實數字到 Phase 3。
 
 ---
 
@@ -832,18 +875,45 @@ strategy:
 
 **LLM 服務啟動要 1–3 分鐘。** 如果先關舊的再開新的，就是 1–3 分鐘的完全斷線。所以必須「先開新的、確認就緒、才關舊的」。
 
-**代價：rollout 期間需要雙倍的資源。** 本機只是多 6GB 記憶體。但 Phase 3 只有一張 GPU 時，這個設定會讓 rollout **永遠卡住** —— 新 pod 永遠等不到 GPU，因為舊 pod 還佔著，而舊 pod 又要等新 pod 就緒才會被關掉。
+**代價：rollout 期間需要雙倍的資源。** Phase 3 只有一張 GPU 時，這個設定會讓 rollout **永遠卡住** —— 新 pod 永遠等不到 GPU，因為舊 pod 還佔著，而舊 pod 又要等新 pod 就緒才會被關掉。
+
+**本機其實已經會卡住了。** OrbStack VM 預設 8 GiB，model-server request 5Gi，新 pod 一樣 `Pending`（`Insufficient memory`），`rollout status` 永遠等不到。任何改到 Pod template 的操作都會中：`rollout restart`、改 args 後 `kubectl apply -k`。
+
+單節點上的兩個解法：
+
+```bash
+# (a) 接受停機：先縮到 0 再套用，會有 1–3 分鐘完全斷線
+kubectl -n pricer delete hpa model-server --ignore-not-found   # HPA 會把 replica 拉回去
+kubectl -n pricer scale deploy/model-server --replicas=0
+kubectl apply -k k8s/overlays/local                            # manifest 的 replicas: 1 會開回 1 個
+```
+
+**(b) 加記憶體**：OrbStack → Settings → System → Memory limit 調到約 12 GiB，才放得下兩個 5Gi 的 request 加上監控元件。16 GiB 的 Mac 這樣會很緊，只在要練 11.3 的「全程 200」時開。
+
+用 (a) 做 11.1 會看到斷線，這不是失敗，是提早體驗 Phase 3 單卡的兩難。
 
 **這是 on-prem 最真實的兩難**，Phase 3 會正面處理它（三個選項：接受停機、多一張卡、或用 time-slicing 假裝有多張卡）。
 
 ### 11.3 驗證
 
-成功條件：整個 rollout 過程中，請求全程 `200`。
+成功條件：整個 rollout 過程中，請求全程 `200`。迴圈要在 `restart` / `undo` **之前**就開始跑，一直到舊 pod 消失才停。
+
+**前提：OrbStack 記憶體要先調到約 12 GiB（11.2 的做法 b）**，預設 8 GiB 放不下 surge 出來的新 pod。確認：
+
+```bash
+kubectl get node orbstack -o jsonpath='{.status.allocatable.memory}{"\n"}'   # 約 12295768Ki
+```
 
 ```bash
 kubectl -n pricer rollout history deploy/model-server
 kubectl -n pricer rollout undo deploy/model-server     # 練一次回滾
 ```
+
+- `rollout restart` 也會產生新 revision：它是在 Pod template 加 `restartedAt` annotation，template 變了就是新的 ReplicaSet。
+- `undo` 回去的那一版會**重新編號成最新**，舊號碼從 history 消失，這是正常的。
+- ⚠️ `undo` 前先用 `rollout history --revision=N` 看清楚目標版本。回到沒有 `--cache-ram 0` 的舊版，OOM 會回來。
+
+實測（2026-09-27，12 GiB）：`restart` 與 `undo` 全程 `200`，新 pod 約 70 秒 ready。測完記得把記憶體調回 8 GiB。
 
 ---
 
@@ -981,18 +1051,18 @@ kubectl -n pricer rollout restart deploy/model-server
 
 ## Phase 0 驗收清單
 
-- [ ] 本機 `llama-server` 跑出第一個 MAE，且落在 $35–$50 之間
-- [ ] 數字已填進 `RESULTS.md`
-- [ ] 已驗證 OrbStack 的 CNI **是否**強制執行 NetworkPolicy（結果記下來）
-- [ ] `kubectl apply -k k8s/overlays/local` 後所有 pod 都 `Running` 且 `restartCount` 為 0
-- [ ] `curl http://pricer.k8s.orb.local/price` 拿得到估價
-- [ ] 刪 pod 時全程 `200`，沒有連線中斷（優雅關機生效）
-- [ ] Prometheus 的 `/targets` 看得到 `model-server` 是 `UP`
-- [ ] Grafana 上四張面板都有資料
-- [ ] CPU HPA **不會觸發**（親眼確認過）
-- [ ] custom metrics HPA 在壓測時實際擴容（`SuccessfulRescale` 事件）
-- [ ] `rollout restart` 過程中服務不中斷
-- [ ] 三份 post-mortem 已寫進 `POSTMORTEMS.md`
+- [x] 本機 `llama-server` 跑出第一個 MAE，且落在 $35–$50 之間
+- [x] 數字已填進 `RESULTS.md`
+- [x] 已驗證 OrbStack 的 CNI **是否**強制執行 NetworkPolicy（結果記下來）
+- [x] `kubectl apply -k k8s/overlays/local` 後所有 pod 都 `Running` 且 `restartCount` 為 0
+- [x] `curl http://pricer.k8s.orb.local/price` 拿得到估價
+- [x] 刪 pod 時全程 `200`，沒有連線中斷（優雅關機生效）
+- [x] Prometheus 的 `/targets` 看得到 `model-server` 是 `UP`
+- [x] Grafana 上四張面板都有資料
+- [x] CPU HPA **不會觸發**（親眼確認過）
+- [x] custom metrics HPA 在壓測時實際擴容（`SuccessfulRescale` 事件）
+- [x] `rollout restart` 過程中服務不中斷
+- [x] 三份 post-mortem 已寫進 `POSTMORTEMS.md`
 
 ---
 

@@ -45,18 +45,26 @@ spec:
   #     t=15s  新 pod 還在載模型，排隊沒變短 → 再擴到 3 個
   #     t=30s  還是沒變短 → 擴到 4 個（已達上限）
   #     t=3min 四個 pod 同時 ready，需求早就過了 → 資源浪費 + 之後一路縮回去
-  #   這就是典型的「積分飽和」。解法是讓擴容的觀察窗長過冷啟動時間。
+  #   這就是典型的「積分飽和」。解法分兩層：
+  #     窗口過濾尖峰 —— stabilizationWindowSeconds：取窗口內建議值的最小值
+  #       （縮容取最大值），需求要持續整個窗口才會動。
+  #     policy 限制速度 —— policies：任何 periodSeconds 內最多變動 value 個 pod。
+  #       擋住上面連續擴容的是這一層：period >= 冷啟動時間，
+  #       新 pod ready 之前不會再加下一個。
   behavior:
     scaleUp:
-      # 至少等 180 秒 —— 必須 >= 冷啟動時間，否則就是上面那個震盪。
+      # 窗口過濾尖峰：排隊要持續 180 秒才擴容，短暫尖峰不理。
       stabilizationWindowSeconds: 180
       policies:
+        # policy 限制速度：任何 180 秒內最多 +1。
+        # period 必須 >= 冷啟動時間，否則就是上面那個震盪。
         - type: Pods
-          value: 1               # 一次只加一個，別一口氣開四個
+          value: 1
           periodSeconds: 180
       selectPolicy: Max
     scaleDown:
       # 縮容要更保守：縮錯的代價（再等 3 分鐘冷啟動）遠高於多留一個 pod 的成本。
+      # 窗口：連續 600 秒都建議縮才縮；policy：任何 300 秒內最多 -1。
       stabilizationWindowSeconds: 600
       policies:
         - type: Pods

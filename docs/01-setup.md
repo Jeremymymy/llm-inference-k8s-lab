@@ -214,7 +214,7 @@ llm-inference-k8s-lab/
 把設定載進 shell：
 ```bash
 cd ~/Desktop/side-projects/llm-inference-k8s-lab
-set -a; . k8s/base/model.conf; set +a
+while IFS='=' read -r k v; do export "$k=$v"; done < <(grep -E '^[A-Z_]+=' k8s/base/model.conf)
 echo "$BASE_MODEL / $ADAPTER_REPO / rank=$LORA_RANK"
 ```
 
@@ -304,14 +304,14 @@ print('--- 正確答案 ---', d[0]['completion'])
 
 ## 開工前的檢查清單
 
-- [ ] AWS G/VT 的 **On-Demand** 配額申請已送出
-- [ ] AWS G/VT 的 **Spot** 配額申請已送出
-- [ ] 月預算 $80 + 日預算 $5 都建好
-- [ ] HuggingFace 已接受 `meta-llama/Llama-3.2-3B` 授權，token 存在 `private/hf-token`
-- [ ] `kubectl` / `helm` / `k9s` / `kind` / `uv` 都有
-- [ ] OrbStack 的 Kubernetes 已開啟
-- [ ] `df -h /` 顯示剩餘空間 > 30GB
-- [ ] `eval/measure.py` 能成功載入資料集
+- [x] AWS G/VT 的 **On-Demand** 配額申請已送出
+- [x] AWS G/VT 的 **Spot** 配額申請已送出
+- [x] 月預算 $80 + 日預算 $5 都建好
+- [x] HuggingFace 已接受 `meta-llama/Llama-3.2-3B` 授權，token 存在 `private/hf-token`
+- [x] `kubectl` / `helm` / `k9s` / `kind` / `uv` 都有
+- [x] OrbStack 的 Kubernetes 已開啟
+- [x] `df -h /` 顯示剩餘空間 > 30GB
+- [x] `eval/measure.py` 能成功載入資料集
 
 配額還在等的時候，直接往下走 —— Phase 0 和 Phase 0.5 完全不需要 AWS。
 

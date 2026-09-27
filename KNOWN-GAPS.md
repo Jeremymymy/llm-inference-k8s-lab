@@ -71,7 +71,7 @@
 
 | 項目 | 解決什麼 | 我會怎麼做 | 為什麼沒做 |
 |---|---|---|---|
-| **NetworkPolicy 實測** | 網路層隔離 | kind + Calico | ⚠️ **OrbStack 和 kindnet 都不強制執行 NetworkPolicy**。我寫了 policy 也驗證了「CNI 到底執不執行」，但**沒有在會執行的 CNI 上實測過效果**。測不出效果就不宣稱會 |
+| **NetworkPolicy 實測** | 網路層隔離 | kind + Calico | ⚠️ **OrbStack 和 kindnet 都不強制執行 NetworkPolicy**（2026-09-26 實測 OrbStack 回傳 200）。我寫了 policy 也驗證了「CNI 到底執不執行」，但**沒有在會執行的 CNI 上實測過效果**。測不出效果就不宣稱會 |
 | **mTLS / 服務網格** | 服務間加密與細粒度授權 | Linkerd（比 Istio 輕）| 對單一服務鏈是過度設計 |
 | **air-gap 部署** | 無外網環境 | `skopeo copy` 搬 image + Harbor 當內部 registry + 模型走內部物件儲存 | 需要模擬隔離環境 |
 | **Image 簽章與掃描** | 供應鏈安全 | cosign + Trivy in CI | 沒有 CI |
@@ -135,7 +135,8 @@
 
 - **GitOps（ArgoCD / Flux）** —— 我用 `kubectl apply -k`，沒有做宣告式的持續同步與 drift 自癒
 - **Admission control** —— 知道 GPU Operator 靠 mutating webhook 注入環境變數（比對提交的 YAML 與實際跑的就看得到），但沒有寫過自己的 webhook 或 policy（Kyverno / OPA Gatekeeper）
-- **Gateway API** —— 能講它解決 Ingress 的 annotation 地獄（timeout / retry 變成一等公民欄位），但沒有實作
+- **Gateway API** —— 能講它解決 Ingress 的 annotation 地獄（timeout 是 HTTPRoute 的正式欄位，不是廠商字串；retry 截至 v1.6 仍在推進），也知道 ingress-nginx 已於 2026-03 退役、官方建議遷移到它，但沒有實作。lab 仍用 ingress-nginx 只為了簡便
+- **Gateway API Inference Extension / llm-d** —— 知道它用 InferencePool + Endpoint Picker 依佇列長度、KV cache、LoRA 做 LLM-aware 路由（跟我 HPA 用的是同一類指標），但沒有實作；我的路由是 Service 的一般負載平衡
 - **KEDA** —— 知道 on-prem 常用它做 queue-based scaling 和 scale-to-zero，比 prometheus-adapter 更常見，但我用的是後者
 - **KServe / Ray Serve / KAITO** —— LLM 專用的 serving 框架，我是手刻 Deployment
 - **CNI 選型與 MTU 調優** —— 用預設的
