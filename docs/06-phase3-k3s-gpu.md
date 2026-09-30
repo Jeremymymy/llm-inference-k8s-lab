@@ -37,6 +37,29 @@
 
 ---
 
+## 精簡路線（本 lab 採用）
+
+完整做完大約要 10–16 小時動手時間。**精簡路線只做「只有真 GPU 才做得到」的部分**，約 6–8 小時、GPU 費用約 $6–8，拿到的是這個 Phase 最有價值的四樣東西：GPU 接進 k8s 的完整鏈路、單卡 rollout 死結的停機數字、time-slicing 對照表、DCGM 三指標。
+
+| Part | 精簡路線 | 理由 |
+|---|---|---|
+| 1. k3s + Container Toolkit | ✅ 必做 | 排查順序的第二層，後面全靠它 |
+| 2. GPU Operator | ✅ 必做 | `nvidia.com/gpu`、time-slicing、DCGM 都從這裡來 |
+| 3. 模型與憑證進叢集 | ✅ 必做 | |
+| 4. 部署 gpu overlay + MAE 對齊 | ✅ 必做 | **證明 k8s 這層沒改變行為**，MAE 要跟 Phase 1 一樣 |
+| 5. `/dev/shm` | 📖 讀就好 | base 已經擋掉了；知道原因、能講就夠，不必故意弄壞 |
+| 6. 單卡 rollout 死結 | ✅ 必做 | 量出停機秒數，這是選項 A 的真實成本 |
+| 7. time-slicing | ✅ 必做 | 1 / 2 / 3 pod 的吞吐、p99、MAE 表 —— 整個 lab 最有說服力的一張表 |
+| 8. DCGM | ✅ 必做 | `GPU_UTIL` vs `SM_ACTIVE` vs `PIPE_TENSOR_ACTIVE`，區辨度最高 |
+| 9. 可觀測性 + HPA | ⏭️ 可選 | 要裝整套 Prometheus stack，最花時間；HPA 的抽象層設計 Phase 0 已經練過 |
+| 10. Helm 實務 | 📖 讀就好 | 那幾個指令與陷阱讀過、能講就夠 |
+
+**bench pod 在 Part 6 建立**，Part 7 的對照表和 Part 8 的 DCGM 觀察都用它產生壓測負載（指令見 Part 9.3 的 `kubectl exec bench -- vllm bench serve ...`，只借那一段，不用裝 Prometheus）。做完 Part 8 就 `kubectl -n pricer delete pod bench`。
+
+**驗收清單照做，但跳過 HPA 那兩項**（「HPA 實際擴容」、「HPA 門檻已校正」），並在 `KNOWN-GAPS.md` 誠實記一筆：「HPA 接 vLLM 指標只做到設計，未在 GPU 上實跑」。
+
+---
+
 ## Part 1：裝 k3s 與 NVIDIA Container Toolkit
 
 ### 1.1 做法
@@ -327,7 +350,19 @@ strategy: maxSurge: 1, maxUnavailable: 0
 | **B. 多一張卡** | 加一個 GPU 節點 | 硬體成本。**on-prem 買不起就是買不起** |
 | **C. time-slicing** | 一張卡對 k8s 宣告成 N 張 | 沒有記憶體與故障隔離（Part 7 會實測） |
 
-先把 A 做一次，親眼看到停機：
+先把 A 做一次，親眼看到停機。
+
+**先開一個 bench pod**（叢集內的「客戶端」，Part 7、8、9 的壓測也都用它）：
+
+```bash
+# vLLM image 在 Part 4 已經被拉進 k3s 了，不用再下載；這個 pod 不要求 GPU
+kubectl -n pricer run bench --image=vllm/vllm-openai:latest \
+  --env="HF_TOKEN=$(cat ~/private/hf-token)" \
+  --command -- sleep infinity
+kubectl -n pricer wait --for=condition=Ready pod/bench --timeout=120s
+```
+
+改成選項 A 的策略，然後從 bench pod 每秒打一次 Service：
 
 ```bash
 kubectl -n pricer patch deploy/model-server --type=json -p='[
@@ -335,14 +370,27 @@ kubectl -n pricer patch deploy/model-server --type=json -p='[
   {"op":"replace","path":"/spec/strategy/rollingUpdate/maxUnavailable","value":1}
 ]'
 
-# 一邊持續打請求
-while true; do curl -s -o /dev/null -w "%{http_code} " localhost:8000/health; sleep 1; done
+# 終端 1：每秒打一次，印出時間戳與結果
+kubectl -n pricer exec bench -- python3 -u -c "
+import time, urllib.request
+while True:
+    try:
+        code = urllib.request.urlopen('http://model-server:8080/health', timeout=2).status
+    except Exception:
+        code = 'DOWN'
+    print(time.strftime('%H:%M:%S'), code)
+    time.sleep(1)
+"
 
-# 另一邊觸發更新 —— 你會看到一長串 000 或 503
+# 終端 2：觸發更新
 kubectl -n pricer rollout restart deploy/model-server
 ```
 
-**把「停機持續多久」量出來記進 `RESULTS.md`。** 這是選項 A 的真實成本，也是說服老闆買第二張卡的數據。
+**停機時間 = 第一個 `DOWN` 到下一個 `200` 之間的秒數。** 把它記進 `RESULTS.md`。這是選項 A 的真實成本，也是說服老闆買第二張卡的數據。
+
+**為什麼不從本機透過 port-forward 打**：`port-forward` 在建立時就綁定**某一個 pod**。舊 pod 一被刪，port-forward 就斷了，而且新 pod 起來後它**不會自動接上** —— 你會看到 `000` 一路延續下去，量到的是「port-forward 斷了多久」，不是服務停了多久。從 bench pod 打 Service 才會在新 pod Ready 的那一刻自動恢復。
+
+> 用 Python 而不是 `curl`，是因為 vLLM image 一定有 Python，但不保證有 curl。
 
 ---
 
@@ -537,13 +585,7 @@ vllm:num_requests_waiting    ─┘
 Phase 0 的 HPA 因為單節點資源不夠，擴容行為是被扭曲的。現在有 time-slicing 的 3 個 GPU 切片，HPA 可以真的從 1 擴到 3：
 
 ```bash
-# 壓測：在叢集裡開一個 bench pod，直接打 Service
-# （vLLM image 已經在節點上了，不用再下載；也不要求 GPU）
-kubectl -n pricer run bench --image=vllm/vllm-openai:latest \
-  --env="HF_TOKEN=$(cat ~/private/hf-token)" \
-  --command -- sleep infinity
-kubectl -n pricer wait --for=condition=Ready pod/bench --timeout=120s
-
+# 壓測：用 Part 6 開的 bench pod（還沒開的話回去照 Part 6 開一個），直接打 Service
 kubectl -n pricer exec bench -- vllm bench serve --backend openai \
   --base-url http://model-server:8080 \
   --model pricer --tokenizer meta-llama/Llama-3.2-3B \
