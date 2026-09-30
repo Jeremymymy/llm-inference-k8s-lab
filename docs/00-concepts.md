@@ -92,7 +92,7 @@ KV cache 大小 = 2（K和V） × 層數 × KV head 數 × head_dim × 序列長
 
 | 設定 | 每個序列的 KV cache | 24GB 卡扣掉權重後能跑幾個並發 |
 |---|---|---|
-| `--max-model-len 131072`（預設） | 很大 | 個位數 |
+| `--max-model-len 131072`（預設） | 約 14 GiB（本 lab 的 3B 模型） | **0 —— 在 L4 上根本起不來**，一條序列就放不下 |
 | `--max-model-len 512`（本 lab） | 極小 | 數百 |
 
 vLLM 啟動時會把「總記憶體 × `--gpu-memory-utilization` − 權重」全部預先劃給 KV cache，並換算成 **blocks**。啟動 log 會直接印出來，那行是你調校時最該看的數字。［Phase 2 驗證］

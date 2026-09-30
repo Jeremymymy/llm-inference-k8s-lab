@@ -72,7 +72,8 @@
 
 | 設定 | 吞吐 | p95 TTFT | GPU blocks |
 |---|---|---|---|
-| `--max-model-len 131072`（預設） | — | — | — |
+| `--max-model-len 131072`（預設） | 起不來 | — | — |
+| `--max-model-len 32768` | — | — | — |
 | `--max-model-len 512` | — | — | — |
 | FP8 量化 | — | — | — |
 | time-slicing 2 replica | — | — | — |

@@ -69,6 +69,8 @@ kubectl get nodes
 
 先裝 toolkit，k3s 會自動幫你建好 `nvidia` 這個 RuntimeClass。
 
+**但「有 RuntimeClass」不等於「pod 會用它」。** k3s 的**預設** runtime 仍然是 runc，pod 要明寫 `runtimeClassName: nvidia` 才會走 NVIDIA runtime。gpu overlay 已經加了這一行（見 Part 4.2）。
+
 ### 1.3 驗證
 
 ```bash
@@ -210,6 +212,7 @@ kubectl -n pricer get pods -w
 | pricer-api 整個 | ✅ | 不變 |
 | image 與 args | llama.cpp | **vLLM** |
 | `nvidia.com/gpu` | — | **新增** |
+| `runtimeClassName: nvidia` | — | **新增** |
 | toleration + nodeSelector | — | **新增** |
 | HF_TOKEN 的 secretKeyRef | — | **新增** |
 
@@ -221,7 +224,7 @@ kubectl -n pricer get pods -w
 # pod 真的拿到卡了嗎（排查順序的第四層）
 kubectl -n pricer exec deploy/model-server -- nvidia-smi
 
-kubectl -n pricer port-forward svc/model-server 8000:8000 &
+kubectl -n pricer port-forward svc/model-server 8000:8080 &   # 本機 8000 → Service 的 8080（再轉到容器的 8000）
 curl -s localhost:8000/v1/models | python3 -m json.tool
 ```
 
@@ -235,6 +238,19 @@ uv run --with datasets eval/measure.py \
 ```
 
 **MAE 應該跟 Phase 1 的 Docker 版完全一樣。** 如果不一樣，代表 k8s 這一層改變了什麼 —— 幾乎都是 args 傳錯（特別是 `--max-lora-rank`）。
+
+### ⚠️ 陷阱：排程成功，但容器裡沒有 GPU
+
+症狀：pod 被排到節點上（代表 `nvidia.com/gpu` 分配成功），但 `kubectl exec ... nvidia-smi` 報 `executable file not found`，或 vLLM 的 log 說找不到 CUDA / `No CUDA GPUs are available`。
+
+原因：**少了 `runtimeClassName: nvidia`**。device plugin 只負責「記帳」（告訴 scheduler 這張卡分給誰了），真正把 GPU 裝置和驅動函式庫塞進容器的是 NVIDIA container runtime。pod 沒指定 RuntimeClass 就會用 k3s 預設的 runc，於是帳上有卡、容器裡沒有。
+
+```bash
+kubectl -n pricer get pod -l app=model-server -o jsonpath='{.items[0].spec.runtimeClassName}'
+# 應該印出 nvidia
+```
+
+另一種解法是裝 k3s 時加 `--default-runtime nvidia`，讓所有 pod 都走 NVIDIA runtime。本 lab 選擇在 pod 上明寫，因為意圖比較清楚，而且不會影響其他不需要 GPU 的 pod。
 
 ---
 
@@ -521,15 +537,30 @@ vllm:num_requests_waiting    ─┘
 Phase 0 的 HPA 因為單節點資源不夠，擴容行為是被扭曲的。現在有 time-slicing 的 3 個 GPU 切片，HPA 可以真的從 1 擴到 3：
 
 ```bash
-# 壓測
-vllm bench serve --backend openai --base-url http://localhost:8000 \
-  --model pricer --dataset-name random \
+# 壓測：在叢集裡開一個 bench pod，直接打 Service
+# （vLLM image 已經在節點上了，不用再下載；也不要求 GPU）
+kubectl -n pricer run bench --image=vllm/vllm-openai:latest \
+  --env="HF_TOKEN=$(cat ~/private/hf-token)" \
+  --command -- sleep infinity
+kubectl -n pricer wait --for=condition=Ready pod/bench --timeout=120s
+
+kubectl -n pricer exec bench -- vllm bench serve --backend openai \
+  --base-url http://model-server:8080 \
+  --model pricer --tokenizer meta-llama/Llama-3.2-3B \
+  --dataset-name random \
   --random-input-len 150 --random-output-len 5 \
   --num-prompts 2000 --request-rate 100
 
-# 觀察
+# 觀察（另一個終端）
 kubectl -n pricer get hpa model-server -w
+
+# 做完收掉
+kubectl -n pricer delete pod bench
 ```
+
+**為什麼不從 port-forward 打**：`kubectl port-forward svc/...` 其實只會連到**其中一個** pod，不會分流。HPA 擴出來的新 pod 根本拿不到流量，你會看到「擴容了但延遲沒改善」這種假象。走 Service（`model-server:8080`，Service 的 port 是 8080，轉到容器的 8000）才會被 kube-proxy 分到所有 replica。
+
+`--tokenizer` 為什麼必須寫，見 Phase 2 Part 2.1。
 
 **用 Phase 2 的曲線回頭校正 HPA 門檻**：你在 Phase 2 找到「排隊長度到多少時 p95 開始爆掉」，那就是 `averageValue` 該設的數字。**這是把量測轉成設定的完整閉環。**
 

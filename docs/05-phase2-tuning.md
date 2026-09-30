@@ -72,19 +72,26 @@ Phase 1 結束時你有一個「會動而且答案正確」的服務。Phase 2 �
 ### 2.1 做法
 
 ```bash
-# 在 GPU 機器上
-pip install --user "vllm[bench]"
-
-vllm bench serve \
+# 在 GPU 機器上：直接用正在跑的 vllm 容器裡的 vllm，不用在主機上另外裝
+docker exec vllm vllm bench serve \
   --backend openai \
   --base-url http://localhost:8000 \
   --model pricer \
+  --tokenizer meta-llama/Llama-3.2-3B \
   --dataset-name random \
   --random-input-len 150 \
   --random-output-len 5 \
   --num-prompts 500 \
   --request-rate inf
 ```
+
+**為什麼用 `docker exec` 而不是 `pip install "vllm[bench]"`**：在主機上 pip 裝 vllm 會拉一整套 torch + CUDA 函式庫，好幾 GB、十幾分鐘，而且這台機器按小時計費。`vllm/vllm-openai` 這個 image 裡本來就有 `vllm` 指令，直接借用就好。容器裡的 `localhost:8000` 就是 vLLM 自己，所以 `--base-url` 不用改。
+
+**為什麼一定要 `--tokenizer`**：`vllm bench serve` 要用 tokenizer 來產生「剛好 150 個 token」的隨機 prompt。沒寫 `--tokenizer` 的話它會拿 `--model` 的值去 HF 找 —— 但 `pricer` 只是我們給 LoRA 取的名字，HF 上沒有這個模型，直接報錯。
+- 容器是用 HF 模型起的（有掛 `$HF_HOME`、有 `HF_TOKEN`）→ `--tokenizer meta-llama/Llama-3.2-3B`
+- 容器是用 merged 權重起的（Part 5 的 FP8，只掛了 `/merged`）→ `--tokenizer /merged`
+
+**如果報缺套件**（例如 `No module named 'pandas'`），代表這版 image 沒帶 bench 需要的額外套件：`docker exec vllm pip install pandas datasets`。注意容器是 `--rm` 起的，重啟後要重裝。
 
 `--request-rate inf` 代表「一次全部送出」，量的是**飽和吞吐**。要量固定負載下的延遲就改成具體數字：
 
@@ -110,8 +117,8 @@ vllm bench serve \
 ```bash
 for rate in 5 10 20 40 80 160; do
   echo "=== request-rate=$rate ==="
-  vllm bench serve --backend openai --base-url http://localhost:8000 \
-    --model pricer --dataset-name random \
+  docker exec vllm vllm bench serve --backend openai --base-url http://localhost:8000 \
+    --model pricer --tokenizer meta-llama/Llama-3.2-3B --dataset-name random \
     --random-input-len 150 --random-output-len 5 \
     --num-prompts 300 --request-rate $rate
 done
@@ -125,10 +132,40 @@ done
 
 ### 3.1 做法
 
-跑三組，**只改這一個參數**：
+**第一步：先試預設值 131072 —— 它很可能根本起不來。**
+
+用前景模式跑（不加 `-d`），這樣錯誤訊息會直接印在終端上：
 
 ```bash
-for mml in 131072 4096 512; do
+docker stop vllm 2>/dev/null
+docker run --rm --name vllm --gpus all --ipc=host -p 8000:8000 \
+  -v "$HF_HOME:/root/.cache/huggingface" \
+  -v /home/ubuntu/adapter:/adapter:ro \
+  -e "HF_TOKEN=$HF_TOKEN" \
+  vllm/vllm-openai:latest \
+    --model meta-llama/Llama-3.2-3B \
+    --enable-lora --lora-modules pricer=/adapter --max-lora-rank 256 \
+    --max-model-len 131072 \
+    --gpu-memory-utilization 0.85
+```
+
+預期會看到類似這樣的錯誤，然後容器直接退出（確切措辭依 vLLM 版本而異）：
+
+```
+ValueError: To serve at least one request with the models's max seq len (131072),
+(14.00 GiB KV cache is needed), which is larger than the available KV cache memory (X GiB).
+Based on the available memory, the estimated maximum model length is NNNNN.
+Try increasing `gpu_memory_utilization` or decreasing `max_model_len` ...
+```
+
+**把 X 和 NNNNN 記進 `RESULTS.md`。** 為什麼會這樣，見 3.2 的算式。
+
+> 如果它**起來了**（例如新版 vLLM 改了行為），那就照原計畫把 131072 當「大」那一組，下面的迴圈把 32768 換回 131072。
+
+**第二步：跑三組能起來的，只改這一個參數**：
+
+```bash
+for mml in 32768 4096 512; do
   docker stop vllm 2>/dev/null
   docker run --rm -d --name vllm --gpus all --ipc=host -p 8000:8000 \
     -v "$HF_HOME:/root/.cache/huggingface" \
@@ -143,8 +180,8 @@ for mml in 131072 4096 512; do
   # 等就緒，然後把 GPU blocks 記下來
   sleep 180
   docker logs vllm 2>&1 | grep -i "GPU blocks"
-  vllm bench serve --backend openai --base-url http://localhost:8000 \
-    --model pricer --dataset-name random \
+  docker exec vllm vllm bench serve --backend openai --base-url http://localhost:8000 \
+    --model pricer --tokenizer meta-llama/Llama-3.2-3B --dataset-name random \
     --random-input-len 150 --random-output-len 5 \
     --num-prompts 500 --request-rate inf
 done
@@ -163,11 +200,29 @@ vLLM 啟動時會把「總記憶體 × `--gpu-memory-utilization` − 權重」*
 
 調到 512，同樣的記憶體可以容納的並發是**數百倍**。
 
+**為什麼 131072 在 L4 上起不來**（粗算，實際數字以 vLLM 的錯誤訊息為準）：
+
+```
+每個 token 的 KV cache = 2 (K 和 V) × 28 層 × 8 個 KV head × 128 維 × 2 bytes (bf16)
+                      = 114,688 bytes ≈ 112 KB
+一條 131072 token 的序列 ≈ 112 KB × 131072 ≈ 14 GiB
+
+L4 可用記憶體        ≈ 22.5 GiB × 0.85 ≈ 19 GiB
+  − bf16 權重                          ≈ 6 GiB
+  − r=256 的 LoRA 槽位、activation、CUDA graph 等  ≈ 2–3 GiB
+  = 能給 KV cache 的                   ≈ 10–11 GiB   <  14 GiB
+```
+
+**vLLM 的規則是：KV cache 至少要放得下「一條最長的序列」，否則拒絕啟動。** 這比「起來了但很慢」好得多 —— 它在啟動時就告訴你設定不合理，而不是讓你在壓測時才發現。
+
+這也是 `--max-model-len` 是「最大槓桿」的另一個證據：**預設值在這張卡上不是「慢」，是「根本不能用」。**
+
 ### 3.3 你應該觀察到什麼
 
 | `--max-model-len` | GPU blocks | 飽和吞吐 | 為什麼 |
 |---|---|---|---|
-| 131072 | 少 | 低 | KV cache 被浪費 |
+| 131072（預設） | — | — | **起不來**：一條序列的 KV cache 就超過可用記憶體 |
+| 32768 | 少 | 低 | KV cache 被浪費 |
 | 4096 | 中 | 中 | |
 | 512 | **多** | **高** | 貼合實際需求 |
 
@@ -177,6 +232,7 @@ vLLM 啟動時會把「總記憶體 × `--gpu-memory-utilization` − 權重」*
 
 - **`--max-model-len` 設得比實際 prompt 短會直接報錯**（不是靜靜截斷，這點比 llama.cpp 好）。留一點餘裕，我們設 512 對 150+5 是很寬裕的。
 - **改這個參數一定要重啟服務**，它是啟動時劃定的。
+- **`--max-model-len` 設太大會拒絕啟動。** 用 `-d --rm` 背景起的話，容器一退出就被刪掉，`docker logs` 什麼都拿不到 —— 你只會看到壓測連不上。所以第一次試新的值時用前景模式跑。
 
 ---
 
@@ -352,7 +408,7 @@ nvidia-smi dmon -s um -d 1
 watch -n 1 'curl -s localhost:8000/metrics | grep -E "num_requests_(running|waiting)|gpu_cache_usage_perc"'
 
 # 視窗 3：壓測本身
-vllm bench serve ...
+docker exec vllm vllm bench serve ...
 ```
 
 ### 7.2 判讀表
@@ -388,7 +444,8 @@ vllm bench serve ...
 
 ## Phase 2 驗收清單
 
-- [ ] `--max-model-len` 三組（131072 / 4096 / 512）的 GPU blocks 與吞吐都記錄了
+- [ ] 預設 131072 的啟動結果記錄了（起不來的話，記下錯誤訊息裡的可用 KV cache 與 estimated maximum model length）
+- [ ] `--max-model-len` 三組（32768 / 4096 / 512）的 GPU blocks 與吞吐都記錄了
 - [ ] request-rate 掃描曲線畫出來了，找到 p99 開始上翹的轉折點
 - [ ] 量化對照表至少有 bf16 與 FP8 兩組，**每組都有 MAE 和吞吐**
 - [ ] 多 LoRA 同時服務兩個 adapter 成功，且量了 1 vs 2 的差異
@@ -402,7 +459,7 @@ vllm bench serve ...
 
 在 `92-interview.md` 裡補上這段（把問號換成你的實際數字）：
 
-> 「我的 workload 是 prefill 主導的（輸入 150 token、輸出 5 token）。把 `--max-model-len` 從預設的 131072 調到 512 之後，KV cache 的 block 數從 ? 增加到 ?，飽和吞吐提升了 ?倍。再往下調就沒有效果了，因為瓶頸已經從 KV cache 轉移到算力 —— 當時 GPU util 是 ?%、KV cache 使用率只有 ?%、但佇列還是在長。FP8 量化把顯存從 6.4GB 降到 ?GB，但吞吐只提升 ?% —— 因為量化省的是記憶體頻寬，而 prefill 是 compute-bound。」
+> 「我的 workload 是 prefill 主導的（輸入 150 token、輸出 5 token）。`--max-model-len` 用預設的 131072 在 L4 上根本起不來 —— 一條序列的 KV cache 就要 14GB，比可用空間還大。從 32768 調到 512 之後，KV cache 的 block 數從 ? 增加到 ?，飽和吞吐提升了 ?倍。再往下調就沒有效果了，因為瓶頸已經從 KV cache 轉移到算力 —— 當時 GPU util 是 ?%、KV cache 使用率只有 ?%、但佇列還是在長。FP8 量化把顯存從 6.4GB 降到 ?GB，但吞吐只提升 ?% —— 因為量化省的是記憶體頻寬，而 prefill 是 compute-bound。」
 
 ---
 

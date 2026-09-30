@@ -21,6 +21,11 @@ spec:
       nodeSelector:
         nvidia.com/gpu.present: "true"
 
+      # ⚠️ k3s 的預設 runtime 是 runc。不指定這個的話，pod 拿得到 nvidia.com/gpu
+      # （排程成功），但容器裡看不到卡 —— vLLM 會在啟動時找不到 CUDA 而 crash。
+      # 「nvidia」這個 RuntimeClass 是 k3s 偵測到 NVIDIA Container Toolkit 後自動建的。
+      runtimeClassName: nvidia
+
       initContainers:
         # vLLM 直接從 HF Hub 拉權重（有 HF cache 的 PVC 撐著），
         # 不需要 Phase 0 那個下載 GGUF 的 initContainer。
