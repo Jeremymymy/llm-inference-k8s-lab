@@ -27,7 +27,7 @@
 
 ### Phase 0.5 —— kind 三節點
 
-> 「單節點環境會給人錯誤的直覺，所以我另外開了三節點的 kind 叢集來矯正。最重要的一個是：`ReadWriteOnce` 的 PVC 在單節點上可以被多個 pod 同時掛載而且完全正常 —— 因為 RWO 的語意是『一個**節點**』不是『一個 pod』。我刻意在多節點上重現了 `Multi-Attach error`，親眼看到它卡在 `ContainerCreating`。
+> 「單節點環境會給人錯誤的直覺，所以我另外開了三節點的 kind 叢集來矯正。最重要的一個是：`ReadWriteOnce` 的 PVC 在單節點上可以被多個 pod 同時掛載而且完全正常 —— 因為 RWO 的語意是『一個**節點**』不是『一個 pod』。我刻意在多節點上重現了跨節點掛載失敗 —— 在 kind 的 local-path 上，它是被 scheduler 以 `volume node affinity conflict` 擋在 `Pending`；換成 EBS 這類網路磁碟，則是排上了才在 `ContainerCreating` 撞 `Multi-Attach error`。同一個 RWO 語意，擋下來的時間點不同。
 >
 > 這個 Phase 我也把 on-prem 的資源治理練完了：ResourceQuota 限制 GPU 配額、PriorityClass 讓線上推論可以搶佔離線評估、PDB 保護節點維護時的可用性。有個技巧是我用 `kubectl proxy` PATCH node status 加了一個假的 extended resource，這樣排程、配額、搶佔的**全部語義**都能在沒有 GPU 的機器上練完，之後換成 `nvidia.com/gpu` 一行都不用改。」
 

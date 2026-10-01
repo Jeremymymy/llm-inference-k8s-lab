@@ -12,7 +12,7 @@ Phase 0 用 OrbStack 很方便，但方便是有代價的 —— **有三件事�
 
 | 你在單節點看到的 | 真實叢集的樣子 |
 |---|---|
-| `ReadWriteOnce` 的 PVC 可以被多個 pod 同時掛載 | `Multi-Attach error`，pod 卡在 `ContainerCreating` |
+| `ReadWriteOnce` 的 PVC 可以被多個 pod 同時掛載 | 另一個節點上的 pod 起不來（kind 上是 `volume node affinity conflict`，EBS 類是 `Multi-Attach error`） |
 | LoadBalancer 開箱就能用 | 卡在 `Pending`，on-prem 要自己裝 MetalLB 並管 IP 池 |
 | `drain` 不知道會發生什麼（唯一的節點） | 節點維護是 on-prem 的日常，而且對 LLM 特別痛 |
 
@@ -23,15 +23,15 @@ Phase 0 用 OrbStack 很方便，但方便是有代價的 —— **有三件事�
 **十個部分：**
 
 1. 開三節點叢集
-2. 刻意重現 `Multi-Attach error`
+2. 刻意重現 RWO 的跨節點失敗
 3. RWX 與模型分發的真實取捨
 4. MetalLB —— on-prem 的 LoadBalancer
 5. 排程：taint、toleration、affinity、spread
 6. cordon / drain / PDB 與那個真實的兩難
 7. 資源治理：ResourceQuota 與 LimitRange
-8. PriorityClass 與 preemption
-9. Job / CronJob 做離線評估
-10. 用假的 extended resource 零成本練 GPU 排程
+8. 用假的 extended resource 零成本練 GPU 排程
+9. PriorityClass 與 preemption
+10. Job / CronJob 做離線評估
 
 ---
 
@@ -41,6 +41,11 @@ Phase 0 用 OrbStack 很方便，但方便是有代價的 —— **有三件事�
 
 ```bash
 cd ~/Desktop/side-projects/llm-inference-k8s-lab
+
+# ⚠️ 先把 OrbStack VM 的記憶體從 8 GiB 調到 12 GiB（理由見下方陷阱）
+orb config get memory_mib                 # 記下原本的值，收工時調回去
+orb config set memory_mib 12288
+orb stop && orb start                     # 記憶體設定要重啟 OrbStack 才生效
 
 orb stop k8s                              # ⚠️ 先關掉 OrbStack 的 k8s
 kind create cluster --config k8s/kind/cluster.yaml
@@ -57,8 +62,42 @@ kubectl get nodes -L node-role.pricer/gpu
 docker build -t pricer-api:dev src/pricer-api
 kind load docker-image pricer-api:dev --name pricer-lab
 
+# kind 是全新的叢集，PVC 是空的 —— LoRA 要重新放一次（做法同 Phase 0 Part 3）。
+# 不放的話 model-server 的 initContainer 會故意失敗（找不到 adapter 就不准啟動）。
+kubectl apply -f k8s/base/namespace.yaml
+kubectl -n pricer apply -f - <<'EOF'
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: model-weights }
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources: { requests: { storage: 20Gi } }
+EOF
+kubectl -n pricer apply -f - <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata: { name: loader }
+spec:
+  containers:
+    - name: shell
+      image: busybox:1.37
+      command: ["sleep", "3600"]
+      volumeMounts: [{ name: models, mountPath: /models }]
+  volumes:
+    - name: models
+      persistentVolumeClaim: { claimName: model-weights }
+EOF
+kubectl -n pricer wait --for=condition=Ready pod/loader --timeout=120s
+kubectl -n pricer cp models/pricer-lora.gguf loader:/models/pricer-lora.gguf
+kubectl -n pricer exec loader -- ls -lh /models
+kubectl -n pricer delete pod loader
+
 kubectl apply -k k8s/overlays/local
+kubectl -n pricer get pods -w      # model-server 第一次啟動會下載 3.4GB 的 base model
 ```
+
+> 這裡先手動建的 PVC 跟 base 裡的定義一模一樣，所以接下來的 `apply -k` 不會衝突。
+> kind 的預設 StorageClass 是 `WaitForFirstConsumer`：PV 會建在 `loader` 被排到的那個節點上，之後 model-server 也會被綁到那個節點 —— 這正是 Part 2 要觀察的東西。
 
 ### 1.2 為什麼是 kind 而不是別的
 
@@ -73,14 +112,25 @@ kubectl apply -k k8s/overlays/local
 
 ### ⚠️ 陷阱
 
-- **記憶體。** 16GB 的機器上絕對不要同時開 OrbStack k8s 和 kind。三節點空載約 1.5–2GB，加上 model-server 的 6GB 就很緊了。切換時 `orb stop k8s`。
+- **記憶體的上限是 OrbStack VM，不是 Mac 的 16GB。** kind 的三個「節點」都是跑在 OrbStack VM 裡的容器，**共用同一份 VM 記憶體**（預設 8 GiB）。用 Phase 0 的實測數字算：
+
+  | | 記憶體 |
+  |---|---|
+  | 一個 llama-server（Q8_0 + LoRA，`--cache-ram 0`） | 穩定 4.3 GiB，高峰 4.66 GiB |
+  | kind 三節點空載 | 約 1.5–2 GiB |
+  | 一個 model-server + 叢集 | 約 6.5 GiB —— 8 GiB 塞得下 |
+  | **兩個 model-server + 叢集** | **約 11 GiB —— 8 GiB 塞不下** |
+
+  Part 3（RWX，兩個 replica 分散在兩個節點）和 Part 5 / 8 / 9（改 pod template 觸發 rollout，新舊 pod 短暫並存）都會同時跑兩個 llama-server，所以要調到 12 GiB。代價是 macOS 只剩約 4GB，做這個 Phase 時先關掉瀏覽器等吃記憶體的程式。
+- **scheduler 看到的記憶體是假的。** kind 節點容器沒有記憶體上限，所以**每個節點的 kubelet 都把整台 VM 的記憶體當成自己的 allocatable**。scheduler 以為兩個 worker 各有 12 GiB，會很放心地一邊放一個 model-server —— 實際上它們搶的是同一份 12 GiB。超過時不是 pod 被 `OOMKilled`，而是整台 VM **System OOM**，被砍的可能是任何行程（見 `POSTMORTEMS.md` 事故 1 最後一段）。真實叢集的節點是獨立機器，不會有這個問題 —— **這是 kind 的限制，不是 k8s 的行為**。
+- **不要同時開 OrbStack k8s 和 kind。** 兩個叢集搶同一台 VM。切換時 `orb stop k8s`。
 - **image 要手動 load。** `kind load docker-image` 這一步 Phase 0 沒有（OrbStack 直接共用 Docker 的 image store）。忘了做的話 pod 會卡在 `ErrImageNeverPull`。
 - **kind 的預設 CNI（kindnet）不強制執行 NetworkPolicy。** 跟 OrbStack 一樣的陷阱。要練就得換 Calico。
 - **kind 叢集不會自動保存。** 重開機後 `kind get clusters` 還在，但容器停了，`docker start` 那幾個容器就能恢復。
 
 ---
 
-## Part 2：刻意重現 `Multi-Attach error`
+## Part 2：刻意重現 RWO 的跨節點失敗
 
 **目的**：矯正 Phase 0 留下的最危險的錯誤直覺。
 
@@ -105,16 +155,42 @@ kubectl -n pricer get pods -l app=model-server -o wide -w
 
 ### 2.2 你會看到什麼
 
-第二個 pod **卡在 `ContainerCreating`**：
+**至少有一個 model-server pod 起不來。** 卡在哪一步、錯誤長什麼樣，取決於 PV 背後是哪種儲存：
 
 ```bash
-kubectl -n pricer describe pod -l app=model-server | grep -A5 "Multi-Attach\|FailedAttachVolume"
+kubectl -n pricer get pods -l app=model-server -o wide
+kubectl -n pricer describe pod -l app=model-server | grep -A5 "FailedScheduling\|FailedAttachVolume"
 ```
+
+**在 kind 上（預設的 local-path provisioner）—— 預期是這個**：pod 卡在 `Pending`
+
+```
+Warning  FailedScheduling  0/3 nodes are available:
+  1 node(s) didn't match pod anti-affinity rules,
+  1 node(s) had untolerated taint {node-role.kubernetes.io/control-plane: },
+  1 node(s) had volume node affinity conflict.
+```
+
+**在 EBS、Ceph RBD 這類網路區塊儲存上**：pod 排上了，但卡在 `ContainerCreating`
 
 ```
 Warning  FailedAttachVolume  Multi-Attach error for volume "pvc-xxxx"
                              Volume is already used by pod(s) model-server-xxx
 ```
+
+> ⚠️ 上面 kind 那段是依 local-path 的機制推論的預期輸出，確切措辭依 k8s 版本而異。**以你實際看到的為準，貼進 `RESULTS.md`。**
+
+**兩種都是同一個道理（RWO 綁節點），只是擋下來的時間點不同**：
+
+| | kind 的 local-path | EBS / Ceph RBD |
+|---|---|---|
+| PV 本質 | 某個節點上的一個目錄（hostPath） | 一顆可以拔下來換節點掛的網路磁碟 |
+| PV 上有沒有 `nodeAffinity` | **有**，寫死在建立它的那個節點 | 沒有（可以跟著 pod 走） |
+| 誰擋下來 | **scheduler**，排程時就知道去別的節點沒用 → `Pending` | **attach/detach controller**，pod 排上了才發現磁碟還掛在別的節點 → `ContainerCreating` |
+
+`kubectl get pv -o yaml | grep -A8 nodeAffinity` 可以親眼看到 local-path 的 PV 被綁在哪個節點。
+
+**順帶一提**：這個 patch 改了 pod template，會觸發 rollout。新 pod 除了要避開舊 pod（anti-affinity），又被 PV 綁回舊 pod 所在的節點 —— 兩個條件互相矛盾，rollout 會一直卡著，舊 pod 繼續跑。所以這一步實際上只會有**一個** llama-server 在跑。
 
 ### 2.3 為什麼 Phase 0 看不到這個
 
@@ -169,12 +245,15 @@ volumeBindingMode: Immediate
 EOF
 ```
 
-改用 RWX 的 PVC：
+改用 RWX 的 PVC。**只換 PVC，不動 Deployment** —— Part 2 加的 `replicas: 2` 與 anti-affinity 要留著：
 
 ```bash
-kubectl -n pricer delete deploy model-server
-kubectl -n pricer delete pvc model-weights
+# 1) 先把 model-server 縮到 0，讓舊 PVC 沒人在用（有 pod 掛著的 PVC 刪不掉，會卡在 Terminating）
+kubectl -n pricer scale deploy/model-server --replicas=0
+kubectl -n pricer wait --for=delete pod -l app=model-server --timeout=120s
 
+# 2) 換成同名的 RWX PVC
+kubectl -n pricer delete pvc model-weights
 kubectl -n pricer apply -f - <<'EOF'
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -184,9 +263,44 @@ spec:
   storageClassName: nfs-rwx
   resources: { requests: { storage: 20Gi } }
 EOF
+
+# 3) 把模型放進新的 PVC —— 這次 base model 也一起放（理由見下）
+kubectl -n pricer apply -f - <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata: { name: loader }
+spec:
+  containers:
+    - name: shell
+      image: busybox:1.37
+      command: ["sleep", "3600"]
+      volumeMounts: [{ name: models, mountPath: /models }]
+  volumes:
+    - name: models
+      persistentVolumeClaim: { claimName: model-weights }
+EOF
+kubectl -n pricer wait --for=condition=Ready pod/loader --timeout=120s
+kubectl -n pricer cp models/base.gguf loader:/models/base.gguf
+kubectl -n pricer cp models/pricer-lora.gguf loader:/models/pricer-lora.gguf
+kubectl -n pricer exec loader -- ls -lh /models
+kubectl -n pricer delete pod loader
+
+# 4) 擴回 2 個 replica
+kubectl -n pricer scale deploy/model-server --replicas=2
+kubectl -n pricer get pods -l app=model-server -o wide -w
 ```
 
-再把模型 `kubectl cp` 進去（做法同 Phase 0 Part 3），然後重新 apply。這次兩個 replica 會分別排到兩個節點上，而且**都能掛載成功**。
+這次兩個 replica 會分別排到兩個節點上，而且**都能掛載成功**。（這一步會同時跑兩個 llama-server，約 11 GiB —— Part 1 把 VM 調到 12 GiB 就是為了這裡。）
+
+**為什麼不「刪掉 Deployment 再 `kubectl apply -k`」**：
+- `apply -k` 會把 Deployment 還原成 base 的樣子：`replicas: 1`、沒有 anti-affinity。你就看不到「兩個 replica 分散在兩個節點」了。
+- base 裡的 PVC 寫的是 `ReadWriteOnce`，叢集裡現在的是 `ReadWriteMany`。**PVC 的 spec 建立後不可變更**，apply 會直接報錯（`spec is immutable`）。
+
+**為什麼 base model 也用 `kubectl cp` 放進去**：initContainer 看到 `/models/base.gguf` 已經存在就會跳過下載，省掉再抓一次 3.4GB。另外 model-server 是以非 root（uid 10001）執行的，NFS 上的目錄不一定開放給非 root 寫入；由 `loader`（root）先放好檔案，model-server 就只需要讀。
+
+### ⚠️ 陷阱
+
+**從這裡開始，這個 Phase 不要再 `kubectl apply -k k8s/overlays/local`。** 理由同上：PVC 已經換成 RWX，apply 會因為 spec 不可變而報錯；就算報錯前其他資源套用成功了，Deployment 也會被還原，把你後面 patch 上去的設定（toleration、nodeSelector、假 GPU……）全部洗掉。後面的 Part 都用 `kubectl patch` 改，就是這個原因。
 
 ### 3.2 為什麼這不是「正解」，只是「一個解」
 
@@ -255,8 +369,8 @@ EBS volume 全程待在儲存系統裡沒動，所以不管你被放到哪台主
 
 | AWS | k8s 的對應 | 共同的性質 |
 |---|---|---|
-| **EBS** | 網路型 PV（EBS CSI、Ceph RBD、iSCSI） | 可以跟著 pod 換節點；但**一次只能掛一個節點** → 這就是 Part 2 那個 `Multi-Attach error` |
-| **Instance store** | **local PV / hostPath** | 快，但綁死在那個節點上。節點沒了資料就沒了 |
+| **EBS** | 網路型 PV（EBS CSI、Ceph RBD、iSCSI） | 可以跟著 pod 換節點；但**一次只能掛一個節點** → Part 2 在這種儲存上就是 `Multi-Attach error` |
+| **Instance store** | **local PV / hostPath** | 快，但綁死在那個節點上。節點沒了資料就沒了 → kind 的 local-path 就是這種，所以 Part 2 在 kind 上是 `volume node affinity conflict` |
 | — | `volumeBindingMode: WaitForFirstConsumer` | 專門為了解決「local PV 在 A 節點但 pod 被排到 B 節點」 |
 
 所以 3.2 那張「模型 200GB × 5 個節點怎麼分發」的表，本質上就是這組取捨放大到叢集尺度：
@@ -522,12 +636,23 @@ kubectl -n pricer describe resourcequota pricer-quota
 試著超出配額：
 
 ```bash
+# 先 cordon GPU 節點：新 pod 會被「建立」（佔配額）但排不上去，
+# 這樣不會真的多跑好幾個 4.5 GiB 的 llama-server 把 VM 撐爆
+kubectl cordon pricer-lab-worker
+
 kubectl -n pricer scale deploy/model-server --replicas=5
-kubectl -n pricer get events --sort-by=.lastTimestamp | tail -5
-# ... exceeded quota: pricer-quota, requested: requests.memory=30Gi, ...
+kubectl -n pricer get pods -l app=model-server         # 1 Running + 幾個 Pending，湊不到 5 個
+kubectl -n pricer get events --sort-by=.lastTimestamp | grep -i quota | tail -3
+# ... exceeded quota: pricer-quota, requested: requests.memory=5Gi, used: requests.memory=..., limited: requests.memory=16Gi
+
+# 做完縮回來 —— 後面的 Part 都假設只有 1 個 model-server
+kubectl -n pricer scale deploy/model-server --replicas=1
+kubectl uncordon pricer-lab-worker
 ```
 
-注意：**Deployment 本身會建立成功，被擋下來的是 ReplicaSet 建 pod 的動作**。所以 `kubectl get deploy` 看起來正常，但 pod 數量就是上不去 —— 要看 events 才知道為什麼。
+注意兩件事：
+- **Deployment 本身會建立成功，被擋下來的是 ReplicaSet 建 pod 的動作**。所以 `kubectl get deploy` 看起來正常，但 pod 數量就是上不去 —— 要看 events 才知道為什麼。
+- **`Pending` 的 pod 也算配額。** 那幾個排不上去的 pod 沒在跑，但已經佔掉 `requests.memory` 了。配額算的是「宣告要多少」，不是「實際用多少」。
 
 ### 7.2 為什麼 ResourceQuota 一定要配 LimitRange
 
@@ -554,131 +679,15 @@ requests.example.com/gpu: "2"
 - `requests` 必須**等於** `limits`（k8s 自動幫你補齊）
 - 不能超賣 —— 這跟 CPU 完全不同，CPU 可以 request 少於 limit
 
-Phase 0.5 用假的 `example.com/gpu` 練（見 Part 10），Phase 3 換成 `nvidia.com/gpu`，**其他設定一行都不用改**。
+Phase 0.5 用假的 `example.com/gpu` 練（見 Part 8），Phase 3 換成 `nvidia.com/gpu`，**其他設定一行都不用改**。
 
 ---
 
-## Part 8：PriorityClass 與 preemption
-
-**目的**：on-prem AI 平台最經典的面試題 —— 線上推論和離線 batch 搶同一張卡怎麼辦。
-
-### 8.1 做法
-
-```bash
-kubectl apply -f k8s/governance/priorityclass.yaml
-kubectl get priorityclass
-```
-
-先讓低優先的 batch job 把資源佔滿：
-
-```bash
-kubectl apply -f k8s/governance/batch-eval-job.yaml
-kubectl -n pricer get pods -l job-name=batch-eval -w
-```
-
-再讓高優先的推論服務進來要資源：
-
-```bash
-kubectl -n pricer patch deploy/model-server --type=json -p='[
-  {"op":"add","path":"/spec/template/spec/priorityClassName","value":"inference-critical"},
-  {"op":"replace","path":"/spec/replicas","value":3}
-]'
-
-# 看搶佔發生
-kubectl -n pricer get events --sort-by=.lastTimestamp | grep -i preempt
-```
-
-你會看到類似：
-```
-Normal  Preempted  pod/batch-eval-xxx  Preempted by pod pricer/model-server-xxx on node ...
-```
-
-### 8.2 為什麼這樣設計
-
-```yaml
-# 高優先：可以搶別人
-name: inference-critical
-value: 1000000
-preemptionPolicy: PreemptLowerPriority
-
-# 低優先：自己不搶別人
-name: batch-best-effort
-value: 100
-preemptionPolicy: Never          # ← 這行很重要
-```
-
-**`preemptionPolicy: Never` 為什麼關鍵**：不設的話，兩個 batch job 會**互相搶佔** —— A 踢掉 B，B 重新排程時踢掉 A，永遠沒有人做得完。這是典型的活鎖。
-
-低優先的工作應該是「有空位就做，沒空位就等」，而不是加入搶位遊戲。
-
-### 8.3 這題為什麼值得練
-
-**單張 GPU 就能真的演。** 這是所有 GPU 相關的 k8s 主題裡，唯一不需要多張卡就能完整示範的。Phase 3 只有一張 L4，但搶佔可以完整重現。
-
-面試答案的形狀：
-> 「我把線上推論設成高優先、離線評估設成低優先且不搶佔。卡不夠時 batch 會被踢掉，它是可重跑的所以沒關係。這樣同一張卡白天服務線上流量、晚上跑評估，利用率上得去，而線上的 SLA 不會被 batch 影響。」
-
-### ⚠️ 陷阱
-
-- **搶佔是「刪除」不是「暫停」。** 被踢掉的 pod 是被殺掉、從頭重來。所以低優先的工作必須是可重跑的，而且最好有 checkpoint。
-- **`globalDefault: true` 只能有一個 PriorityClass。** 設了之後所有沒指定優先級的 pod 都會拿到它，影響範圍很大，這個 lab 兩個都設 `false`。
-- **PDB 會擋搶佔嗎？** 排程器會**盡量**尊重 PDB，但在找不到其他方案時仍會違反它。PDB 對搶佔是「盡力而為」，不是硬保證。
-
----
-
-## Part 9：Job / CronJob 做離線評估
-
-**目的**：batch 推論是 LLM 平台的真實需求（離線評估、資料集標註、embedding 重算），而且它天然就是上一節那個被搶佔的角色。
-
-### 9.1 做法
-
-看 `k8s/governance/batch-eval-job.yaml` 的四個關鍵欄位：
-
-```yaml
-completions: 60        # 總共要完成 60 個分片
-parallelism: 3         # 同時跑 3 個
-backoffLimit: 4        # 最多容忍 4 次失敗
-activeDeadlineSeconds: 1800   # 超過 30 分鐘直接砍
-ttlSecondsAfterFinished: 600  # 完成 10 分鐘後自動清掉
-```
-
-```bash
-kubectl -n pricer delete job batch-eval --ignore-not-found
-kubectl apply -f k8s/governance/batch-eval-job.yaml
-kubectl -n pricer get job batch-eval -w
-```
-
-### 9.2 為什麼用 Job 而不是自己寫迴圈
-
-| 你自己寫迴圈 | k8s Job |
-|---|---|
-| 跑到一半機器掛了 → 全部重來 | 只有失敗的分片重跑 |
-| 平行度要自己管 | `parallelism` 一行 |
-| 失敗重試要自己寫 | `backoffLimit` |
-| 卡住的話要自己發現 | `activeDeadlineSeconds` 自動砍 |
-| 結果散落各處 | 統一在 Job 物件裡 |
-
-**`ttlSecondsAfterFinished` 特別值得提**：沒有它的話，完成的 Job 物件會一直累積在 etcd 裡。一個每小時跑一次的 CronJob，一年就是 8760 個 Job 物件。這是真實會發生的 etcd 膨脹來源。
-
-### 9.3 CronJob 的兩個陷阱
-
-如果改成 CronJob（例如每晚跑評估）：
-
-```yaml
-concurrencyPolicy: Forbid    # 上一輪還沒跑完就不要開新的
-startingDeadlineSeconds: 300 # 錯過排程時間超過 5 分鐘就放棄這一輪
-```
-
-- **`concurrencyPolicy` 預設是 `Allow`。** 評估跑 2 小時但排程是每小時一次的話，會越積越多直到把叢集壓垮。
-- **`startingDeadlineSeconds` 不設的話**，叢集停機一天後恢復，會一口氣補跑所有錯過的排程。
-
----
-
-## Part 10：用假的 extended resource 零成本練 GPU 排程
+## Part 8：用假的 extended resource 零成本練 GPU 排程
 
 **目的**：這是這個 Phase 投報率最高的技巧 —— **排程、配額、優先級、搶佔的全部語義，都能在沒有 GPU 的機器上練完。**
 
-### 10.1 做法
+### 8.1 做法
 
 ```bash
 kubectl proxy --port=8001 &
@@ -705,21 +714,50 @@ kubectl -n pricer patch deploy/model-server --type=json -p='[
 kubectl -n pricer get pods -o wide
 ```
 
-試著要超過 4 張：
+試著要超過剩下的卡數。model-server 已經佔了 1 張，剩 3 張 —— 用一個輕量 pod 去要 4 張：
 
 ```bash
-kubectl -n pricer scale deploy/model-server --replicas=5
-kubectl -n pricer describe pod -l app=model-server | grep -A3 "FailedScheduling"
-# 0/3 nodes are available: 1 Insufficient example.com/gpu, 2 node(s) didn't match Pod's node affinity
+kubectl apply -f - <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata: { name: gpu-hog, namespace: default }
+spec:
+  tolerations:
+    - { key: pricer.io/gpu, operator: Equal, value: "true", effect: NoSchedule }
+  containers:
+    - name: sleep
+      image: busybox:1.37
+      command: ["sleep", "3600"]
+      resources:
+        limits: { example.com/gpu: "4" }
+EOF
+kubectl describe pod gpu-hog | grep -A3 "FailedScheduling"
+# 0/3 nodes are available: 1 Insufficient example.com/gpu, ...
+kubectl delete pod gpu-hog
 ```
 
-### 10.2 為什麼這值得做
+**為什麼不用 `scale deploy/model-server --replicas=5`**：每多一個 replica 就多一個 4.5 GiB 的 llama-server，VM 會先被記憶體撐爆，你看到的會是記憶體問題而不是 GPU 排程。busybox 幾乎不吃記憶體，只考驗 GPU 這一個變數。
+
+**為什麼放在 `default` namespace**：`pricer` 有 Part 7 的 ResourceQuota，只允許 2 張 GPU。把上面的 `namespace` 改成 `pricer` 再 apply 一次，你會看到**完全不同的失敗** —— pod 根本建不起來：
+
+```
+Error from server (Forbidden): ... exceeded quota: pricer-quota, requested: requests.example.com/gpu=4, ...
+```
+
+| | 擋在哪一關 | pod 物件存在嗎 | 在哪裡看 |
+|---|---|---|---|
+| `exceeded quota` | **admission**（API server 收件時） | ❌ 不存在 | `kubectl apply` 的錯誤、ReplicaSet 的 events |
+| `Insufficient example.com/gpu` | **scheduling**（找節點時） | ✅ 存在，卡 `Pending` | `kubectl describe pod` |
+
+這個區別在 Part 9 會直接決定搶佔能不能發生。
+
+### 8.2 為什麼這值得做
 
 **你可以練到的**（全部零成本）：
 - extended resource 的整數限制、requests 必須等於 limits、不可超賣
 - 排程器在資源不足時的行為與 `FailedScheduling` 訊息怎麼讀
 - `ResourceQuota` 對 GPU 的限制
-- `PriorityClass` 的搶佔在 GPU 稀缺時的行為
+- `PriorityClass` 的搶佔在 GPU 稀缺時的行為（Part 9）
 - PDB 與 drain 在「資源不可替代」時的互動
 
 **你練不到的**：驅動、CUDA、記憶體隔離、真實的 GPU 效能。那些是 Phase 3 的事。
@@ -731,6 +769,139 @@ kubectl -n pricer describe pod -l app=model-server | grep -A3 "FailedScheduling"
 - **這是假的。** 文件裡、面試時都要明講「我用假的 extended resource 練 scheduler 語義，真的 GPU 在 Phase 3」。假裝自己有 GPU 叢集是會被問穿的。
 - **kubelet 重啟後這個容量可能會消失**，再 PATCH 一次就好。
 - **記得收掉 `kubectl proxy`**：`kill %1`。
+
+---
+
+## Part 9：PriorityClass 與 preemption
+
+**目的**：on-prem AI 平台最經典的面試題 —— 線上推論和離線 batch 搶同一張卡怎麼辦。
+
+### 9.1 做法
+
+**前提**：Part 8 的 4 張假 GPU 還在，model-server 佔著其中 1 張（`kubectl describe node pricer-lab-worker | grep example.com/gpu` 確認）。
+
+```bash
+# 先拿掉 Part 7 的 ResourceQuota（LimitRange 留著）—— 理由見下
+kubectl -n pricer delete resourcequota pricer-quota
+
+kubectl apply -f k8s/governance/priorityclass.yaml
+kubectl get priorityclass
+```
+
+**為什麼要先拿掉配額**：配額擋在 admission，搶佔發生在 scheduling（Part 8 那張表）。`pricer` 的配額只允許 2 張 GPU —— batch 佔滿配額之後，model-server 的新 pod **連建立都建立不了**，scheduler 根本看不到它，也就不會為它搶佔。**搶佔救不了配額。** 這在真實平台上是很常見的誤會：「我設了高優先級，為什麼還是起不來？」—— 先看是不是卡在 quota。
+
+先讓低優先的 batch job 把卡佔滿：
+
+```bash
+kubectl apply -f k8s/governance/batch-eval-job.yaml
+kubectl -n pricer get pods -l job-name=batch-eval -o wide
+# 3 個 batch pod Running（parallelism: 3，各佔 1 張）+ model-server 的 1 張 = 4 張全滿
+kubectl describe node pricer-lab-worker | grep -A8 "Allocated resources" | grep example.com/gpu
+```
+
+再讓高優先的推論服務進來要卡：
+
+```bash
+# 只改優先級、不加 replica。改 pod template 會觸發 rollout（maxSurge: 1），
+# 新 pod 要 1 張卡，但 4 張全滿 → scheduler 踢掉一個 batch pod
+kubectl -n pricer patch deploy/model-server --type=json -p='[
+  {"op":"add","path":"/spec/template/spec/priorityClassName","value":"inference-critical"}
+]'
+
+# 看搶佔發生
+kubectl -n pricer get events --sort-by=.lastTimestamp | grep -i preempt
+kubectl -n pricer get pods -l job-name=batch-eval -w
+```
+
+**為什麼不順便把 replicas 調到 3**：每個 replica 都是一個 4.5 GiB 的 llama-server，rollout 期間新舊並存已經是兩個，再加就超過 12 GiB 的 VM 了。一個新 pod 就足以觸發搶佔。
+
+**接著觀察被踢掉之後發生什麼**：Job 會補一個新的 batch pod，但它卡在 `Pending` —— 優先級低、而且 `preemptionPolicy: Never`，不會反過來搶。等舊的 model-server pod 關掉、釋出那張卡，它才排進去。**這就是「有空位就做，沒空位就等」的實際樣子。**
+
+你會看到類似：
+```
+Normal  Preempted  pod/batch-eval-xxx  Preempted by pod pricer/model-server-xxx on node ...
+```
+
+### 9.2 為什麼這樣設計
+
+```yaml
+# 高優先：可以搶別人
+name: inference-critical
+value: 1000000
+preemptionPolicy: PreemptLowerPriority
+
+# 低優先：自己不搶別人
+name: batch-best-effort
+value: 100
+preemptionPolicy: Never          # ← 這行很重要
+```
+
+**`preemptionPolicy: Never` 為什麼關鍵**：不設的話，兩個 batch job 會**互相搶佔** —— A 踢掉 B，B 重新排程時踢掉 A，永遠沒有人做得完。這是典型的活鎖。
+
+低優先的工作應該是「有空位就做，沒空位就等」，而不是加入搶位遊戲。
+
+### 9.3 這題為什麼值得練
+
+**單張 GPU 就能真的演。** 這是所有 GPU 相關的 k8s 主題裡，唯一不需要多張卡就能完整示範的（這裡用的 4 張假卡只是為了讓 batch 有地方跑）。Phase 3 只有一張 L4，但搶佔可以完整重現。
+
+面試答案的形狀：
+> 「我把線上推論設成高優先、離線評估設成低優先且不搶佔。卡不夠時 batch 會被踢掉，它是可重跑的所以沒關係。這樣同一張卡白天服務線上流量、晚上跑評估，利用率上得去，而線上的 SLA 不會被 batch 影響。」
+
+### ⚠️ 陷阱
+
+- **搶佔是「刪除」不是「暫停」。** 被踢掉的 pod 是被殺掉、從頭重來。所以低優先的工作必須是可重跑的，而且最好有 checkpoint。
+- **`globalDefault: true` 只能有一個 PriorityClass。** 設了之後所有沒指定優先級的 pod 都會拿到它，影響範圍很大，這個 lab 兩個都設 `false`。
+- **PDB 會擋搶佔嗎？** 排程器會**盡量**尊重 PDB，但在找不到其他方案時仍會違反它。PDB 對搶佔是「盡力而為」，不是硬保證。
+
+---
+
+## Part 10：Job / CronJob 做離線評估
+
+**目的**：batch 推論是 LLM 平台的真實需求（離線評估、資料集標註、embedding 重算），而且它天然就是上一節那個被搶佔的角色。
+
+### 10.1 做法
+
+看 `k8s/governance/batch-eval-job.yaml` 的四個關鍵欄位：
+
+```yaml
+completions: 60        # 總共要完成 60 個分片
+parallelism: 3         # 同時跑 3 個
+backoffLimit: 4        # 最多容忍 4 次失敗
+activeDeadlineSeconds: 1800   # 超過 30 分鐘直接砍
+ttlSecondsAfterFinished: 600  # 完成 10 分鐘後自動清掉
+```
+
+```bash
+kubectl -n pricer delete job batch-eval --ignore-not-found
+kubectl apply -f k8s/governance/batch-eval-job.yaml
+kubectl -n pricer get job batch-eval -w
+```
+
+> 這個 Job 的每個 pod 要 1 張假 GPU（為了 Part 9 的搶佔）。如果 pod 卡 `Pending` 且訊息是 `Insufficient example.com/gpu`，多半是 kubelet 重啟後假容量消失了 —— 照 Part 8 再 PATCH 一次。
+
+### 10.2 為什麼用 Job 而不是自己寫迴圈
+
+| 你自己寫迴圈 | k8s Job |
+|---|---|
+| 跑到一半機器掛了 → 全部重來 | 只有失敗的分片重跑 |
+| 平行度要自己管 | `parallelism` 一行 |
+| 失敗重試要自己寫 | `backoffLimit` |
+| 卡住的話要自己發現 | `activeDeadlineSeconds` 自動砍 |
+| 結果散落各處 | 統一在 Job 物件裡 |
+
+**`ttlSecondsAfterFinished` 特別值得提**：沒有它的話，完成的 Job 物件會一直累積在 etcd 裡。一個每小時跑一次的 CronJob，一年就是 8760 個 Job 物件。這是真實會發生的 etcd 膨脹來源。
+
+### 10.3 CronJob 的兩個陷阱
+
+如果改成 CronJob（例如每晚跑評估）：
+
+```yaml
+concurrencyPolicy: Forbid    # 上一輪還沒跑完就不要開新的
+startingDeadlineSeconds: 300 # 錯過排程時間超過 5 分鐘就放棄這一輪
+```
+
+- **`concurrencyPolicy` 預設是 `Allow`。** 評估跑 2 小時但排程是每小時一次的話，會越積越多直到把叢集壓垮。
+- **`startingDeadlineSeconds` 不設的話**，叢集停機一天後恢復，會一口氣補跑所有錯過的排程。
 
 ---
 
@@ -785,15 +956,15 @@ spec:
 ## Phase 0.5 驗收清單
 
 - [ ] 三節點叢集跑起來，`kubectl get nodes` 看到 3 個 Ready
-- [ ] **親眼看到 `Multi-Attach error`**（這是本 Phase 最重要的一項）
+- [ ] **親眼看到 RWO 讓另一個節點的 pod 起不來**，並記下實際的錯誤訊息（kind 上預期是 `volume node affinity conflict`；這是本 Phase 最重要的一項）
 - [ ] RWX 的 PVC 讓兩個 replica 分散在不同節點上都掛載成功
 - [ ] MetalLB 給 LoadBalancer 發出真實 IP，且 `curl` 得通
 - [ ] taint 造成 `FailedScheduling`，加上 toleration + nodeSelector 後恢復
 - [ ] `drain` 被 PDB 擋住（單 replica + minAvailable: 1）
 - [ ] 超出 ResourceQuota 時 pod 被拒絕，events 裡看得到 `exceeded quota`
+- [ ] 假的 `example.com/gpu` 讓 pod 在超額時 `FailedScheduling`，並對照過 `exceeded quota` 的差別
 - [ ] **`kubectl get events` 看到 `Preempted`**
 - [ ] batch Job 的 `completions` / `parallelism` 正常分片完成
-- [ ] 假的 `example.com/gpu` 讓 pod 在超額時 `FailedScheduling`
 - [ ] 已確認並記錄 kind 的 CNI 是否執行 NetworkPolicy
 
 ---
@@ -802,6 +973,8 @@ spec:
 
 ```bash
 kind delete cluster --name pricer-lab
+orb config set memory_mib 8192            # 調回原本的值（Part 1 記下的那個）
+orb stop && orb start
 ```
 
 **AWS 的 GPU 配額這時候應該已經下來了。** 查一下：

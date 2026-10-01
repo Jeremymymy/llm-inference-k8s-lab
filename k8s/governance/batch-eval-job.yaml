@@ -1,8 +1,13 @@
 # ============================================================================
 # 離線評估 Job —— 同時示範 Job 語義與「被搶佔的低優先工作」
 # ============================================================================
-# 這個 Job 刻意用 batch-best-effort 優先級。Phase 0.5 會讓它先佔住資源，
+# 這個 Job 刻意用 batch-best-effort 優先級。Phase 0.5 會讓它先佔住（假的）GPU，
 # 再讓高優先的 model-server 進來把它踢掉，然後在事件裡看到 Preempted。
+#
+# 為什麼要 GPU 而不是只要 CPU/記憶體：搶佔只在「踢掉低優先 pod 就排得進去」時
+# 才會發生。這個 Job 的 pod 只要 128Mi，踢光也騰不出 model-server 要的 5Gi，
+# scheduler 判斷搶佔沒用就不會搶。兩邊搶同一種稀缺資源，才演得出來。
+# ⚠️ 前提：節點上已經有假的 example.com/gpu（docs/03 Part 8），否則會卡 Pending。
 #
 # 真正的 MAE 量測還是用本機的 eval/measure.py（它要 datasets 套件，
 # 包成 image 不划算）。這個 Job 的重點是 k8s 的 Job 機制本身。
@@ -26,6 +31,12 @@ spec:
     spec:
       restartPolicy: Never
       priorityClassName: batch-best-effort    # ← 低優先，可被搶佔
+      # 假 GPU 在 pricer-lab-worker 上，那個節點在 docs/03 Part 5 被上了 taint
+      tolerations:
+        - key: pricer.io/gpu
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
       containers:
         - name: probe
           image: curlimages/curl:8.11.1
@@ -49,3 +60,4 @@ spec:
               memory: 128Mi
             limits:
               memory: 256Mi
+              example.com/gpu: "1"   # 每個分片佔一張（假的）卡
