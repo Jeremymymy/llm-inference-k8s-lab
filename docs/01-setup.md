@@ -33,7 +33,7 @@
 | 未微調的 Llama 3.2 (4-bit) | $110.72 |
 | **微調後（本 lab 要復現的）** | **$39.85** |
 
-所以：**如果你的服務跑出 $110 左右，代表 LoRA 根本沒生效**（這正是 Phase 1 那個 `--max-lora-rank` 陷阱的症狀）。有了這個門檻，你不用猜，數字會直接告訴你。
+所以：**如果你的服務跑出 $110 左右，代表 LoRA 根本沒生效**（例如請求打到了 base model 而不是 adapter）。有了這個門檻，你不用猜，數字會直接告訴你。
 
 ---
 
@@ -245,7 +245,7 @@ dropout: 0.1
 target_modules: q_proj k_proj v_proj o_proj gate_proj up_proj down_proj（七個全含）
 ```
 
-**`r=256` 會在 Phase 1 咬你一口**，因為 vLLM 的 `--max-lora-rank` 預設是 16。先記住這件事。
+**`r=256` 會在 Phase 1 咬你一口**，因為 vLLM 的 `--max-lora-rank` 預設是 16 —— 不設成 256 的話服務起不來。先記住這件事。
 
 ---
 

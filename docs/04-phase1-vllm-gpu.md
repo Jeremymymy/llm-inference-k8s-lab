@@ -27,7 +27,7 @@ nvidia-smi 看得到卡嗎
 2. 磁碟與模型快取
 3. 把 vLLM 跑起來
 4. 正確性驗證 —— 對齊 MAE $39.85
-5. 刻意失敗：`--max-lora-rank` 的無聲截斷
+5. 刻意失敗：`--max-lora-rank` 與兩種失敗模式
 6. 原創實驗：runtime LoRA vs merged 權重
 7. 四方對照表
 
@@ -132,7 +132,12 @@ mkdir -p "$HF_HOME"
 mkdir -p ~/private && chmod 700 ~/private
 # 從本機複製上來：
 #   scp -i <key> private/hf-token ubuntu@<IP>:~/private/hf-token
-export HF_TOKEN=$(cat ~/private/hf-token)
+# 寫進 bashrc —— 只在當下 shell export 的話，隔天重連後就是空的
+echo 'export HF_TOKEN=$(cat ~/private/hf-token)' >> ~/.bashrc
+source ~/.bashrc
+
+# vLLM 的編譯快取，理由見 Part 3.2
+mkdir -p ~/vllm-cache
 ```
 
 ### 2.2 為什麼 HF cache 的位置很重要
@@ -197,6 +202,7 @@ docker run --rm -d --name vllm \
   --ipc=host \
   -p 8000:8000 \
   -v "$HF_HOME:/root/.cache/huggingface" \
+  -v "$HOME/vllm-cache:/root/.cache/vllm" \
   -v /home/ubuntu/adapter:/adapter:ro \
   -e "HF_TOKEN=$HF_TOKEN" \
   vllm/vllm-openai:latest \
@@ -217,18 +223,29 @@ docker logs -f vllm            # 等它說 "Application startup complete"
 |---|---|
 | `--ipc=host` | vLLM 用共享記憶體做行程間通訊。不設的話預設 `/dev/shm` 只有 64MB，**負載一上來就 crash**。（Phase 3 在 k8s 裡的對應是 `emptyDir: {medium: Memory}`） |
 | `--gpus all` | 沒有這個容器裡看不到 GPU |
-| `--max-lora-rank 256` | **我們的 adapter 是 r=256，預設值是 16。** 見 Part 5，這是本階段最重要的陷阱 |
-| `--max-model-len 512` | prompt 約 150 + 輸出 5。預設是 131072，會把 KV cache 浪費掉 99% 以上。**這是本 workload 最大的效能槓桿**，Phase 2 會量化它的影響 |
+| `--max-lora-rank 256` | **我們的 adapter 是 r=256，預設值是 16。** 不設的話 vLLM 啟動時就會拒絕載入 adapter，見 Part 5 |
+| `--max-model-len 512` | prompt 約 150 + 輸出 5。預設 131072 在 L4 上很可能連啟動都不行（一條 131072 token 序列的 KV cache 就要約 14 GiB，Phase 2 Part 3 實測）。設 512 也是一道防線：超長的請求直接被拒絕。**它對吞吐的影響其實不大** —— 這跟很多人的直覺相反，Phase 2 會量給你看 |
 | `--gpu-memory-utilization 0.85` | 預先劃給權重 + KV cache 的比例。0.9 是預設，留一點餘裕比較不會在尖峰爆掉 |
+| `-v $HOME/vllm-cache:/root/.cache/vllm` | vLLM 啟動時會做 torch.compile 與 CUDA graph 編譯，結果快取在容器的 `~/.cache/vllm`。容器是 `--rm` 起的，不掛出來的話**每次重啟都要重編** —— Phase 2 每組實驗都要重啟，累積起來很可觀。（快取路徑依 vLLM 版本而異，跑過一次後 `ls ~/vllm-cache` 確認有東西寫進去） |
 | `--served-model-name base` | 讓 base model 和 LoRA 有不同的名字，這樣同一個服務可以兩個都打 —— Part 6 的對照實驗要用 |
 
-**啟動 log 裡最該看的那一行**：
+**啟動 log 裡最該看的那兩行**：
+
+```bash
+docker logs vllm 2>&1 | grep -E "KV cache size|Maximum concurrency"
+```
 
 ```
-# GPU blocks: 12345, # CPU blocks: 2048
+GPU KV cache size: 98,000 tokens
+Maximum concurrency for 512 tokens per request: 191.41x
 ```
 
-這是 vLLM 劃給 KV cache 的 block 數。`--max-model-len` 調小之後這個數字會暴增，直接對應「能跑多少並發」。**Phase 2 調校時，這一行是你的儀表板。**
+（數字是示意，確切措辭依 vLLM 版本而異。舊版 vLLM 印的是 `# GPU blocks: N`，現在的版本已經不印這行了。）
+
+- **第一行**：KV cache 總共放得下多少 token。由「`--gpu-memory-utilization` 劃出的記憶體 − 權重 − 其他開銷」決定，**跟 `--max-model-len` 幾乎無關**。
+- **第二行**：「如果每個請求都長到 `--max-model-len`，能同時跑幾個」的**最壞情況估計**。vLLM 的 KV cache 是**按需分配**的（PagedAttention），實際能跑多少並發，看的是請求真正用了多少 token，不是這個數字。
+
+**Phase 2 調校時，這兩行是你的儀表板。**
 
 ### 3.3 驗證
 
@@ -248,11 +265,11 @@ curl -s localhost:8000/v1/completions \
 
 ### ⚠️ 陷阱
 
-- **`--lora-modules` 在容器裡必須用絕對路徑。相對路徑會靜靜失敗**，不報錯，然後你的估價全是 base model 的水準。
+- **`--lora-modules` 要用容器內的路徑**（`/adapter`，不是主機上的 `/home/ubuntu/adapter`）。路徑錯的話 vLLM 啟動時就會報 `LoRAAdapterNotFoundError` 並退出 —— 用 `-d --rm` 背景跑的話，容器一退出就被刪掉，`docker logs` 什麼都拿不到。**第一次跑新設定時先用前景模式**（不加 `-d`）。
 - **必須用 `/v1/completions`，不是 `/v1/chat/completions`。** base model 沒有 chat template，套 chat 格式的話 prompt 就不是訓練時的樣子。
 - **回傳只有「續寫」部分，不含 prompt。** 課程 Modal 版的 `result.split("Price is $")[1]` 照抄會 IndexError —— 那是因為 HF 的 `generate()` 會把 prompt 一起回傳，vLLM 不會。
-- **gated model 需要 `HF_TOKEN`**，而且要接受過授權。403 就是這個問題。
-- **第一次啟動要下載 6.4GB 的權重**，加上 CUDA graph 編譯，總共 2–5 分鐘。這個時間就是 Phase 3 `startupProbe` 的依據 —— **現在就量一下並記下來**。
+- **gated model 需要 `HF_TOKEN`**，而且要接受過授權。403 就是這個問題。隔天重連後出現 401，先 `echo ${#HF_TOKEN}` 看是不是 0（Part 2 有把它寫進 `~/.bashrc`）。
+- **第一次啟動要下載 6.4GB 的權重**，加上 torch.compile / CUDA graph 編譯，總共 2–5 分鐘。這個時間就是 Phase 3 `startupProbe` 的依據 —— **現在就量一下並記下來**。⚠️ 要量的是**沒有編譯快取**的那一次：k8s 裡新排到節點的 pod 不會有你的 `~/vllm-cache`。
 
 ---
 
@@ -282,8 +299,8 @@ uv run --with datasets eval/measure.py \
 | MAE | 代表什麼 | 下一步 |
 |---|---|---|
 | **$36 ~ $45** | ✅ 正確。LoRA 完整生效 | 記進 `RESULTS.md`，往 Part 5 走 |
-| **$105 ~ $115** | ❌ LoRA 完全沒生效 | 檢查 `--lora-modules` 路徑是不是絕對路徑、`--model` 有沒有打成 `pricer` |
-| **$50 ~ $80** | ⚠️ **部分生效** | 極可能是 `--max-lora-rank` 太小造成的截斷。Part 5 就是在講這個 |
+| **$105 ~ $115** | ❌ LoRA 完全沒生效 | 請求打到 base 了：檢查 `--model` 有沒有打成 `pricer`（adapter 路徑錯的話 vLLM 根本起不來，不會走到這裡） |
+| **$50 ~ $80** | ⚠️ 介於中間 | 先確認跟 Phase 0 用的是同一份評估（`eval/measure.py`、`--size 200`、`temperature 0`），再跟 Phase 0 的 $40.79 對照 |
 
 **同時記下 base model 的分數當對照組**：
 
@@ -312,18 +329,20 @@ uv run --with datasets eval/measure.py \
 
 ---
 
-## Part 5：刻意失敗 —— `--max-lora-rank` 的無聲截斷
+## Part 5：刻意失敗 —— `--max-lora-rank` 與兩種失敗模式
 
-**這是整個 lab 最好的一個教材。** 務必實際做一次。
+**務必實際做一次。** 但它示範的是「**大聲失敗**」—— 真正危險的是它的反面，這一節要把兩種並排看清楚。
 
-### 5.1 做法
+### 5.1 做法：不帶 `--max-lora-rank` 啟動
 
 ```bash
 docker stop vllm
 
-docker run --rm -d --name vllm \
+# 前景模式（不加 -d）：它應該起不來，錯誤要直接印在終端上
+docker run --rm --name vllm \
   --gpus all --ipc=host -p 8000:8000 \
   -v "$HF_HOME:/root/.cache/huggingface" \
+  -v "$HOME/vllm-cache:/root/.cache/vllm" \
   -v /home/ubuntu/adapter:/adapter:ro \
   -e "HF_TOKEN=$HF_TOKEN" \
   vllm/vllm-openai:latest \
@@ -333,42 +352,40 @@ docker run --rm -d --name vllm \
     --lora-modules pricer=/adapter \
     --max-model-len 512 \
     --gpu-memory-utilization 0.85
-    # ← 注意：這次「沒有」--max-lora-rank，用預設值
-```
-
-然後跑同一份評估：
-
-```bash
-uv run --with datasets eval/measure.py \
-  --base-url http://localhost:8000 --model pricer --size 200 \
-  --label "phase1-vllm-bf16-DEFAULT-max-lora-rank"
+    # ← 注意：這次「沒有」--max-lora-rank，用預設值 16
 ```
 
 ### 5.2 你會觀察到什麼
 
-**服務正常啟動。健康檢查通過。API 正常回應。回傳的是合法的價格數字。**
+base model 載完、要掛 LoRA 時直接報錯退出：
 
-**但 MAE 是錯的。**
+```
+ValueError: LoRA rank 256 is greater than max_lora_rank 16.
+```
 
-把兩組數字並排放進 `RESULTS.md`：
+> 這是依目前 vLLM 原始碼（`vllm/lora/peft_helper.py` 的 rank 檢查、`init_static_loras()` 載入失敗就中止啟動）推得的預期。確切訊息與時間點依版本而異 —— **以你實際看到的為準，貼進 `RESULTS.md`**。舊版 vLLM 的行為可能不同。
 
-| 設定 | MAE | 服務有起來嗎 | API 有回應嗎 |
-|---|---|---|---|
-| `--max-lora-rank 256` | 約 $40 | ✅ | ✅ |
-| 預設值（16） | **偏掉** | ✅ | ✅ |
+**服務根本不會起來。** vLLM 啟動時會驗證每個 `--lora-modules`：rank、路徑，還有它不支援的設定（DoRA、adapter bias 等）。任何一個不過就中止。
 
-### 5.3 為什麼這件事這麼重要
+這跟 Phase 0 的 initContainer「找不到 adapter 就不准啟動」是同一個設計哲學：**fail fast**。
 
-`--max-lora-rank` 的支援值是 8/16/32/64/128/256/320/512，**預設是 16**。我們的 adapter 是 **r=256**。
+### 5.3 真正危險的是另一種
 
-當 adapter 的 rank 超過設定值時，vLLM 會**載入它能載的部分**，而不是拒絕啟動。你得到一個「部分生效」的 LoRA。
+| | **大聲失敗** | **無聲失敗** |
+|---|---|---|
+| 例子 | `--max-lora-rank` 太小、adapter 路徑錯 | 請求的 `model` 打到 `base` 而不是 `pricer`（例如 pricer-api 的 `MODEL_NAME` 設錯） |
+| 服務起得來嗎 | ❌ | ✅ |
+| health check / readiness | ❌ | ✅ 全綠 |
+| API | — | ✅ HTTP 200，回傳合法的價格 |
+| MAE | — | ❌ 約 $110 |
+| 誰抓得到 | 任何一個 probe | **只有業務層面的正確性驗證** |
 
-**這證明了一件事：服務起來 ≠ 正確。**
+無聲失敗你在 Part 4 其實已經做過了 —— 就是那個 `--model base` 的對照組。**把兩邊並排記進 `RESULTS.md`。**
 
-所有的健康檢查、readiness probe、`/v1/models` 回應、HTTP 200 —— 全部都是綠的。只有**業務層面的正確性驗證**能抓到這個錯誤。
+**這證明了一件事：服務起來 ≠ 正確。** 所有的健康檢查、readiness probe、`/v1/models` 回應、HTTP 200 都是綠的，只有 MAE 會告訴你答案錯了。
 
 **面試答案的形狀**：
-> 「我在部署 LoRA 時踩過一個坑：adapter 的 rank 是 256，但 vLLM 的 `--max-lora-rank` 預設是 16，超過的部分會被靜靜截斷。服務完全正常、API 也正常回應，但預測品質掉了。這件事讓我在 CI 裡加了一個 MAE 門檻檢查 —— 光有 health check 抓不到這種錯誤。」
+> 「我的 adapter 是 r=256，vLLM 的 `--max-lora-rank` 預設 16。不設的話 vLLM 啟動時就會拒絕 —— 這是好的設計，大聲的錯誤很好處理。真正危險的是反過來的情況：上游把請求的 model 名稱設成 base，服務完全正常、health check 全綠、回傳合法的價格，但 MAE 從 $40 變成 $110。所以我在部署流程裡加了一道 MAE 門檻 —— health check 只抓得到大聲的錯誤。」
 
 ### 5.4 這件事的通用啟示
 
@@ -390,34 +407,46 @@ uv run --with datasets eval/measure.py \
 
 ### 6.1 做法
 
-先把 LoRA merge 進 base（在 GPU 機器上做，記憶體充裕）：
+先把 LoRA merge 進 base。**在 vLLM 的 image 裡做**，那裡已經有 torch 和 transformers，只要補裝 peft：
 
 ```bash
-pip install --user torch transformers peft accelerate
+# 先停掉 vLLM：merge 在 CPU 上做，會吃掉十幾 GB 的「主機」記憶體，
+# 而 g6.xlarge 只有 16 GiB。vLLM 還開著的話兩邊加起來可能把主機擠到 OOM。
+docker stop vllm
 
-python3 - <<'PY'
+cat > ~/merge.py <<'EOF'
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
 
 base = AutoModelForCausalLM.from_pretrained(
-    "meta-llama/Llama-3.2-3B", torch_dtype=torch.bfloat16, device_map="cpu"
+    "meta-llama/Llama-3.2-3B", torch_dtype=torch.bfloat16
 )
-merged = PeftModel.from_pretrained(
-    base, "/home/ubuntu/adapter"
-).merge_and_unload()
-merged.save_pretrained("/home/ubuntu/merged")
-AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-3B").save_pretrained("/home/ubuntu/merged")
+merged = PeftModel.from_pretrained(base, "/work/adapter").merge_and_unload()
+merged.save_pretrained("/work/merged")
+AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-3B").save_pretrained("/work/merged")
 print("merge 完成")
-PY
+EOF
+
+docker run --rm \
+  -v "$HF_HOME:/root/.cache/huggingface" \
+  -v /home/ubuntu:/work \
+  -e "HF_TOKEN=$HF_TOKEN" \
+  --entrypoint bash \
+  vllm/vllm-openai:latest \
+  -c "pip install -q peft && python3 /work/merge.py"
+
+ls -lh ~/merged
 ```
+
+**為什麼不在主機上 `pip install torch transformers peft`**：torch 加上 CUDA 函式庫要下載好幾 GB、裝十幾分鐘，在按小時計費的機器上是純浪費。vLLM 的 image 本來就有一套對得上版本的 torch。
 
 起一個 merged 版本的服務：
 
 ```bash
-docker stop vllm
 docker run --rm -d --name vllm \
   --gpus all --ipc=host -p 8000:8000 \
+  -v "$HOME/vllm-cache:/root/.cache/vllm" \
   -v /home/ubuntu/merged:/merged:ro \
   vllm/vllm-openai:latest \
     --model /merged \
@@ -426,7 +455,19 @@ docker run --rm -d --name vllm \
     --gpu-memory-utilization 0.85
 ```
 
-兩邊都跑一次評估，**同時記 MAE 和吞吐**（吞吐的正式量測在 Phase 2，這裡先用 `measure.py` 的 `--workers 20` 抓個概數）。
+兩邊都跑一次評估，**同時記 MAE 和吞吐**：
+
+- **MAE**：照 Part 4，從本機跑 `eval/measure.py`
+- **吞吐**：在 GPU 機器上跑 `vllm bench serve`（做法見 Phase 2 Part 2.1）
+
+```bash
+docker exec vllm vllm bench serve --backend openai --base-url http://localhost:8000 \
+  --model pricer --tokenizer /merged --dataset-name random \
+  --random-input-len 150 --random-output-len 5 --num-prompts 500 --request-rate inf
+# runtime LoRA 那邊把 --tokenizer 換成 meta-llama/Llama-3.2-3B
+```
+
+**為什麼吞吐不用本機的 `measure.py --workers 20` 量**：本機到 us-east-1 要繞半個地球，一來一回約 200ms，量到的主要是網路延遲，不是 GPU。`measure.py` 只用來算 MAE。
 
 ### 6.2 取捨在哪
 
@@ -464,9 +505,9 @@ docker run --rm -d --name vllm \
 | 1 | leaderboard（未微調） | 4-bit | 無 | $110.72 | 「LoRA 沒生效」的指紋 |
 | 2 | Mac / llama.cpp | Q8_0 | GGUF f16 runtime | ? | Phase 0 |
 | 3 | GPU / vLLM | bf16 | runtime, rank 256 | ? | Phase 1 主線 |
-| 4 | GPU / vLLM | bf16 | runtime, **預設 rank 16** | ? | 刻意失敗的對照 |
+| 4 | GPU / vLLM | bf16 | runtime, **預設 rank 16** | 起不來 | 大聲失敗：記下錯誤訊息 |
 | 5 | GPU / vLLM | bf16 | **merged** | ? | 應與 #3 幾乎相同 |
-| 6 | GPU / vLLM | bf16 | 無（base） | ? | 應接近 #1 |
+| 6 | GPU / vLLM | bf16 | 無（base） | ? | 應接近 #1；**無聲失敗**的樣子 |
 
 **這張表就是你的面試素材。** 它證明的不是「我會部署 vLLM」，而是「我會設計對照實驗、我知道每個數字為什麼是那樣」。
 
@@ -478,10 +519,10 @@ docker run --rm -d --name vllm \
 - [ ] vLLM 的 `/v1/models` 同時列出 `base` 與 `pricer`
 - [ ] 主線 MAE 落在 $36–$45
 - [ ] base model 的對照組 MAE 落在 $105–$115
-- [ ] **`--max-lora-rank` 截斷實驗的兩組數字都記錄了**
+- [ ] **預設 `--max-lora-rank` 的啟動錯誤訊息記錄了**，並跟 base 對照組（無聲失敗）並排
 - [ ] merged vs runtime LoRA 的 MAE 幾乎相同（驗證 merge 正確）
 - [ ] 已量並記下 vLLM 的**冷啟動時間**（Phase 3 的 `startupProbe` 要用）
-- [ ] 啟動 log 的 `# GPU blocks` 數字已記下（Phase 2 調校的基準）
+- [ ] 啟動 log 的 `KV cache size` 與 `Maximum concurrency` 已記下（Phase 2 調校的基準）
 - [ ] 對照表七行都填完
 - [ ] **機器已 `stop`**
 

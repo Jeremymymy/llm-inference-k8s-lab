@@ -26,8 +26,7 @@
 
 | 症狀 | 最可能的原因 | 確認方式 | 修法 |
 |---|---|---|---|
-| **MAE 約 $110** | LoRA 完全沒生效 | 打 `--model base` 比對，如果兩者一樣就確定了 | 檢查 `--lora-modules` 路徑是否為**絕對路徑**；檢查請求的 `model` 欄位是不是 adapter 名稱 |
-| **MAE 約 $50–$80** | `--max-lora-rank` 太小，adapter 被**靜靜截斷** | 加 `--max-lora-rank 256` 重跑對照 | 設成 adapter 的實際 rank（見 `k8s/base/model.conf` 的 `LORA_RANK`） |
+| **MAE 約 $110** | LoRA 完全沒生效 —— 請求打到 base 了 | 打 `--model base` 比對，如果兩者一樣就確定了 | 檢查請求的 `model` 欄位（pricer-api 的 `MODEL_NAME`）是不是 adapter 名稱 |
 | **MAE 略差但不離譜** | 量化漂移 | 換 bf16 跑一次對照 | 這是預期行為，記錄下來不是修 |
 | 回傳的價格總是 0 | prompt 模板不對，或 parse 失敗 | 看 `raw` 欄位的原始文字 | `Price is $` 的 `$` 後面**不能有空白** |
 | `IndexError` | 照抄了 Modal 版的 `split("Price is $")[1]` | — | vLLM / llama.cpp 只回續寫部分，不含 prompt。直接對回傳做 regex |
@@ -60,10 +59,10 @@
 |---|---|---|
 | 負載一上來就 crash、shared memory 相關錯誤 | `/dev/shm` 預設只有 64MB | Docker：`--ipc=host`；**k8s：掛 `emptyDir: {medium: Memory}` 到 `/dev/shm`** |
 | 掛了 `/dev/shm` 之後改成 OOMKilled | `medium: Memory` 的 emptyDir **會算進容器的記憶體 limit** | memory limit 要加上 shm 的大小 |
-| 啟動時 CUDA OOM | `--gpu-memory-utilization` 太高，或同卡上有別的 pod | time-slicing 時每個 pod 的值要**除以 pod 數** |
+| 啟動時 CUDA OOM，或報可用顯存不足 | `--gpu-memory-utilization` 太高，或同卡上有別的 pod | time-slicing 時每個 pod 的值要**除以 pod 數**，而且每一份都要放得下「權重 + LoRA + CUDA 開銷」—— bf16 的 3B 模型在 L4 上最多 2 個 pod（見 docs/06 Part 7.2） |
 | 403 / gated repo | 沒有 HF token，或沒接受授權 | 確認 Secret 掛對了，且已在 HF 網頁接受 Llama 3.2 授權 |
 | 啟動極慢（>5 分鐘） | 在下載權重 + 編 CUDA graph | 把 HF cache 放 PVC；debug 時可暫時用 `--enforce-eager` 跳過 CUDA graph |
-| 吞吐遠低於預期 | `--max-model-len` 沒調 | 預設 131072 會浪費 99% 以上的 KV cache。看啟動 log 的 `# GPU blocks` |
+| 啟動就失敗：`... KV cache is needed, which is larger than the available KV cache memory` | `--max-model-len` 太大（預設 131072），一條最長序列的 KV cache 放不下 | 調小 `--max-model-len`（本 lab 用 512），或調高 `--gpu-memory-utilization`。錯誤訊息裡的 `estimated maximum model length` 就是這張卡撐得住的上限 |
 
 ---
 

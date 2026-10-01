@@ -29,15 +29,15 @@
 |---|---|---|---|---|---|---|---|---|
 | 1 | 2026-09-25 | Mac / llama.cpp | Q8_0 | GGUF f16 runtime | $40.79 | 72.1% | 75.0% | Phase 0；4 次 MAE 完全相同 |
 | 2 | | GPU / vLLM | bf16 | runtime, rank 256 | | | | Phase 1 主線 |
-| 3 | | GPU / vLLM | bf16 | runtime, **預設 rank 16** | | | | 刻意失敗 |
+| 3 | | GPU / vLLM | bf16 | runtime, **預設 rank 16** | 起不來 | — | — | 大聲失敗：備註欄貼啟動錯誤訊息 |
 | 4 | | GPU / vLLM | bf16 | merged | | | | 應與 #2 一致 |
 | 5 | | GPU / vLLM | bf16 | 無（base） | | | | 應接近 $110 |
-| 6 | | GPU / vLLM | **FP8** | runtime, rank 256 | | | | 量化代價 |
+| 6 | | GPU / vLLM | **FP8** | merged | | | | 量化代價（跟 #4 比） |
 | 7 | | k3s / vLLM | bf16 | runtime, rank 256 | | | | **應與 #2 完全一致** |
 
-**#2 vs #3 的差距** = `--max-lora-rank` 無聲截斷造成的損失：___
+**#2 vs #5 的差距** = 請求打到 base（無聲失敗）的代價：___
 **#2 vs #1 的差距** = Q8_0 量化的代價：___
-**#2 vs #6 的差距** = FP8 量化的代價：___
+**#4 vs #6 的差距** = FP8 量化的代價（兩者都是 merged，只差量化）：___
 
 ---
 
@@ -56,13 +56,14 @@ Mac / OrbStack（VM 8 GiB）/ llama.cpp Q8_0 + LoRA，`--parallel 4`。`eval/mea
 
 g6.xlarge / NVIDIA L4 24GB。工具：`vllm bench serve`，`--random-input-len 150 --random-output-len 5`。
 
-### `--max-model-len` 的影響（最大的槓桿）
+### `--max-model-len` 的影響（預期：131072 起不來，其餘三組吞吐差不多 —— KV cache 按需分配）
 
-| `--max-model-len` | GPU blocks | 飽和吞吐 (req/s) | p50 TTFT | p95 TTFT | p99 TTFT |
-|---|---|---|---|---|---|
-| 131072（預設） | | | | | |
-| 4096 | | | | | |
-| 512 | | | | | |
+| `--max-model-len` | KV cache size (tokens) | Maximum concurrency | 飽和吞吐 (req/s) | p50 TTFT | p95 TTFT | p99 TTFT |
+|---|---|---|---|---|---|---|
+| 131072（預設） | 起不來？ | | | | | |
+| 32768 | | | | | | |
+| 4096 | | | | | | |
+| 512 | | | | | | |
 
 ### request-rate 掃描（找 SLA 轉折點）
 
@@ -107,7 +108,7 @@ g6.xlarge / NVIDIA L4 24GB。工具：`vllm bench serve`，`--random-input-len 1
 |---|---|---|---|---|---|
 | 1 pod 獨佔 | | | | | |
 | 2 pod time-sliced | | | | | |
-| 3 pod time-sliced | | | | | |
+| 3 pod time-sliced（選作：bf16 放不下，需 FP8 merged） | | | | | |
 
 **結論**：___
 

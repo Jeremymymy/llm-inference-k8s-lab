@@ -620,7 +620,7 @@ llama.cpp 提供這些指標（Phase 3 的 vLLM 有語意對應的版本）：
 |---|---|---|
 | `llamacpp:requests_processing` | `vllm:num_requests_running` | 正在處理中 |
 | `llamacpp:requests_deferred` | `vllm:num_requests_waiting` | **排隊中 ← 擴縮訊號** |
-| `llamacpp:kv_cache_usage_ratio` | `vllm:gpu_cache_usage_perc` | KV cache 用了多少 |
+| `llamacpp:kv_cache_usage_ratio` | `vllm:kv_cache_usage_perc` | KV cache 用了多少 |
 | `llamacpp:prompt_tokens_total` | `vllm:prompt_tokens_total` | prefill 的 token 累計 |
 | `llamacpp:tokens_predicted_total` | `vllm:generation_tokens_total` | decode 的 token 累計 |
 | `llamacpp:tokens_predicted_seconds_total` | — | decode 累計耗時 |

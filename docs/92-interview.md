@@ -35,21 +35,21 @@
 
 > 「我刻意先用純 Docker 跑 vLLM，不一開始就上 k8s。因為 GPU 問題的排查順序是由下往上 —— `nvidia-smi` → `docker run --gpus all` → device plugin → pod。一開始就疊 k8s，出問題時分不清是哪一層。
 >
-> 這個階段我踩到一個很值得講的坑：我的 adapter 是 r=256，但 vLLM 的 `--max-lora-rank` 預設是 16。超過的部分會被**靜靜截斷** —— 服務正常啟動、健康檢查通過、API 正常回應合法的價格數字，但 MAE 從 $? 掉到 $?。**只有業務層面的正確性驗證抓得到這個錯誤。** 這件事讓我意識到推論服務的部署流程需要一道 MAE 門檻檢查，光有 health check 不夠。」
+> 這個階段我刻意對照了兩種失敗。我的 adapter 是 r=256，vLLM 的 `--max-lora-rank` 預設是 16 —— 不設的話 vLLM **啟動時就拒絕**，這是大聲的錯誤，很好處理。真正危險的是無聲的那種：請求的 model 名稱打到 base，服務正常啟動、健康檢查通過、API 正常回應合法的價格數字，但 MAE 從 $? 變成 $?。**只有業務層面的正確性驗證抓得到這個錯誤。** 這件事讓我意識到推論服務的部署流程需要一道 MAE 門檻檢查，光有 health check 不夠。」
 
 ### Phase 2 —— 效能調校
 
 > 「我的 workload 是 **prefill 主導**的：輸入約 150 token、輸出只有 5 token。這個特性推翻了很多 LLM 推論的『常識』。
 >
-> 最大的槓桿是 `--max-model-len`。Llama-3.2 預設 context 是 131072，但我只需要 512。預設值在 L4 上根本起不來 —— 一條 131072 token 序列的 KV cache 就要約 14GB，比扣掉權重後的可用空間還大，vLLM 直接拒絕啟動。能起來的設定裡，vLLM 會把記憶體預先全部劃給 KV cache，設太大的話絕大部分被保留給永遠不會發生的情況。從 32768 調到 512 之後，KV cache 的 block 數從 ? 增加到 ?，飽和吞吐提升了 ?倍。
+> 很多人以為 `--max-model-len` 是最大的槓桿，我實測的結果是：預設的 131072 在 L4 上根本起不來 —— 一條 131072 token 序列的 KV cache 就要約 14GB，比扣掉權重後的可用空間還大，vLLM 直接拒絕啟動。但能起來的 32768、4096、512 三組，吞吐只差 ?%。因為 vLLM 的 KV cache 是按需分配的（PagedAttention），max-model-len 不會替每個請求預留空間 —— 它只影響啟動檢查，和 log 裡『最大並發』那個最壞情況的估計。
 >
-> 量化的結果反而是反直覺的：FP8 把顯存從 6.4GB 降到 ?GB，但吞吐只提升了 ?%。因為量化省的是**記憶體頻寬**，而 prefill 是 compute-bound。不過顯存下降本身有價值 —— 它讓我後面能在一張卡上跑多個 replica。」
+> 量化的結果也是反直覺的：FP8 把權重從 6.4GB 降到 ?GB，但吞吐只提升了 ?%。因為量化省的是**記憶體頻寬**，而 prefill 是 compute-bound。不過權重變小本身有價值 —— 在一張卡上跑多個 replica 時，真正的限制是「每個 pod 都要一份權重」，不是 KV cache。」
 
 ### Phase 3 —— GPU 上的 k8s
 
 > 「我沒有用 EKS。GPU 加 k8s 的核心知識在單機 k3s 上完全學得到，而且更貼近 on-prem 的場景，還省掉每月 $73 的控制平面租金。
 >
-> 單張卡讓我撞到一個真實的死結：`maxSurge: 1 / maxUnavailable: 0` 的滾動更新永遠卡住，因為新 pod 等不到 GPU，而舊 pod 要等新 pod 就緒才會被關掉。`nvidia.com/gpu` 不可切分也不可超賣。三個選項各有代價 —— 接受 ? 秒停機、多買一張卡、或用 time-slicing。我用 time-slicing 把一張 L4 宣告成 3 張，然後把代價量出來：總吞吐 ?，但 **p99 從 ? 惡化到 ?**。
+> 單張卡讓我撞到一個真實的死結：`maxSurge: 1 / maxUnavailable: 0` 的滾動更新永遠卡住，因為新 pod 等不到 GPU，而舊 pod 要等新 pod 就緒才會被關掉。`nvidia.com/gpu` 不可切分也不可超賣。三個選項各有代價 —— 接受 ? 秒停機、多買一張卡、或用 time-slicing。我用 time-slicing 把一張 L4 宣告成 3 張，然後把代價量出來：總吞吐 ?，但 **p99 從 ? 惡化到 ?**。而且 k8s 以為有 3 張卡，實際上 bf16 權重只塞得下 2 個 pod —— 第 3 個 pod 排程成功、啟動時才因為顯存不夠失敗，scheduler 完全看不到這件事。
 >
 > 還有一件事我覺得最有價值：`nvidia-smi` 的 GPU-Util 是騙人的。它只回答『有沒有 kernel 在跑』，不回答『算力有沒有被用滿』。我用 DCGM 的 `SM_ACTIVE` 和 `PIPE_TENSOR_ACTIVE` 量到 GPU-Util 是 ?% 但 SM_ACTIVE 只有 ?% —— 這個落差才是真正可行動的資訊。」
 

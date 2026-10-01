@@ -49,7 +49,7 @@
 | 4. 部署 gpu overlay + MAE 對齊 | ✅ 必做 | **證明 k8s 這層沒改變行為**，MAE 要跟 Phase 1 一樣 |
 | 5. `/dev/shm` | 📖 讀就好 | base 已經擋掉了；知道原因、能講就夠，不必故意弄壞 |
 | 6. 單卡 rollout 死結 | ✅ 必做 | 量出停機秒數，這是選項 A 的真實成本 |
-| 7. time-slicing | ✅ 必做 | 1 / 2 / 3 pod 的吞吐、p99、MAE 表 —— 整個 lab 最有說服力的一張表 |
+| 7. time-slicing | ✅ 必做 | 1 / 2 pod 的吞吐、p99、MAE 表 —— 整個 lab 最有說服力的一張表 |
 | 8. DCGM | ✅ 必做 | `GPU_UTIL` vs `SM_ACTIVE` vs `PIPE_TENSOR_ACTIVE`，區辨度最高 |
 | 9. 可觀測性 + HPA | ⏭️ 可選 | 要裝整套 Prometheus stack，最花時間；HPA 的抽象層設計 Phase 0 已經練過 |
 | 10. Helm 實務 | 📖 讀就好 | 那幾個指令與陷阱讀過、能講就夠 |
@@ -260,7 +260,7 @@ uv run --with datasets eval/measure.py \
   --label "phase3-k3s-vllm-bf16"
 ```
 
-**MAE 應該跟 Phase 1 的 Docker 版完全一樣。** 如果不一樣，代表 k8s 這一層改變了什麼 —— 幾乎都是 args 傳錯（特別是 `--max-lora-rank`）。
+**MAE 應該跟 Phase 1 的 Docker 版完全一樣。** 如果不一樣，代表 k8s 這一層改變了什麼 —— 最常見的是請求打到了 `base` 而不是 `pricer`（pricer-api 的 `MODEL_NAME`、或 args 裡的 `--served-model-name` / `--lora-modules` 名稱對不上）。
 
 ### ⚠️ 陷阱：排程成功，但容器裡沒有 GPU
 
@@ -415,40 +415,51 @@ kubectl get node -o jsonpath='{.items[0].metadata.labels}' | tr ',' '\n' | grep 
 # nvidia.com/gpu.replicas=3
 ```
 
-**現在必須把每個 pod 的 `--gpu-memory-utilization` 調小**：
+**現在必須把每個 pod 的 `--gpu-memory-utilization` 調小**（理由與數字見 7.2）。先用 1 個 replica，把 Part 6 的死結解開：
 
 ```bash
+# 先確認 "0.85" 在 args 裡的索引 —— 照 overlay 的寫法是 12（11 是旗標名稱本身）
+kubectl -n pricer get deploy model-server -o jsonpath='{.spec.template.spec.containers[0].args}' | tr ',' '\n' | cat -n
+
 kubectl -n pricer patch deploy/model-server --type=json -p='[
-  {"op":"replace","path":"/spec/template/spec/containers/0/args/11","value":"0.28"},
-  {"op":"replace","path":"/spec/replicas","value":2}
+  {"op":"replace","path":"/spec/template/spec/containers/0/args/12","value":"0.42"},
+  {"op":"replace","path":"/spec/strategy/rollingUpdate/maxSurge","value":1},
+  {"op":"replace","path":"/spec/strategy/rollingUpdate/maxUnavailable","value":0}
 ]'
-# ⚠️ args 的索引要對照 kubectl get deploy model-server -o yaml 確認，別照抄
+kubectl -n pricer rollout status deploy/model-server
 ```
 
-現在把 `maxSurge` 改回 1，rollout 就不會卡住了。
+這次 rollout 不會卡住：新 pod 拿到第 2 個切片，新舊兩個 pod 各 0.42，加起來 0.84 塞得進一張卡。**⚠️ 索引寫錯（例如 11）會把 `--gpu-memory-utilization` 這個旗標本身換掉，vLLM 會因為參數錯誤起不來。**
+
+再擴到 2 個 replica，量 7.3 的表：
+
+```bash
+kubectl -n pricer scale deploy/model-server --replicas=2
+```
 
 ### 7.2 為什麼這個 workload 特別適合示範
 
-**這不是紙上談兵，是真的跑得起來的**：
+**先算清楚塞得下幾個**（粗算，實際以啟動 log 為準）：
 
 ```
-L4 顯存                    24 GB
-3B bf16 權重               ~6.5 GB  ← 每個 pod 都要一份
---max-model-len 512 的 KV cache  極小
+L4 顯存（nvidia-smi 顯示）        ≈ 22.5 GiB
+每個 pod 能用的                    = 22.5 GiB × --gpu-memory-utilization
+每個 pod 的固定開銷                ≈ bf16 權重 6 GiB + r=256 的 LoRA 槽位、activation、CUDA graph 約 1.5–2.5 GiB
 
-2 個 pod × (6.5 權重 + 一點 KV cache) ≈ 15 GB  ✓ 塞得下
-3 個 pod ≈ 21 GB                              ✓ 勉強（沒什麼餘裕）
+2 pod × 0.42 → 每個 9.4 GiB，扣掉固定開銷還剩 1–2 GiB 給 KV cache   ✓
+3 pod × 0.28 → 每個 6.3 GiB，連固定開銷都放不下                      ✗
 ```
 
-**Phase 2 把 `--max-model-len` 調到 512 這件事，在這裡二次獲利** —— 它讓 KV cache 幾乎不佔空間，於是多 replica 變成可能。
+**真正限制 replica 數的是「每個 pod 都要一份權重」，不是 KV cache。** KV cache 是按需分配的，150 token 的請求佔得很少，留一兩 GiB 就能跑很高的並發（見 Phase 2 Part 3）。
+
+這也是量化在本 workload 的真正價值：FP8 把每份權重砍到約 3.6 GB，3 個 pod 才有可能（選作：把 overlay 換成 Phase 2 的 FP8 merged 權重）。
 
 ### 7.3 必須量的那張表
 
 | 設定 | 吞吐 (req/s) | p50 TTFT | **p99 TTFT** | MAE |
 |---|---|---|---|---|
-| 1 pod 獨佔整張卡 | | | | |
-| 2 pod time-sliced | | | | |
-| 3 pod time-sliced | | | | |
+| 1 pod 獨佔整張卡（0.85） | | | | |
+| 2 pod time-sliced（各 0.42） | | | | |
 
 **預期結果**：總吞吐略降（context switch 有成本），但 **p99 會明顯惡化**。
 
@@ -458,7 +469,7 @@ L4 顯存                    24 GB
 
 1. **完全沒有記憶體隔離。** 兩個 pod 共用同一塊 24GB HBM，**k8s 對此一無所知**。兩個 pod 都用預設的 `--gpu-memory-utilization 0.9` → 第二個直接 CUDA OOM。這是最常見的翻車點。
 2. **沒有故障隔離。** 一個 pod 觸發 XID error，同卡上所有 pod 一起死。
-3. **`nvidia.com/gpu: 3` 是謊報。** scheduler 以為有三張卡，對記憶體壓力毫無感知。**這正是 production 要用 MIG 的理由。**
+3. **`nvidia.com/gpu: 3` 是謊報。** scheduler 以為有三張卡，對記憶體壓力毫無感知。**這正是 production 要用 MIG 的理由。** 親眼看一次：2 個 replica 時再 `rollout restart`，第 3 個 pod 會**排程成功**（拿到第 3 個切片），然後在啟動時因為顯存不夠而 CrashLoop —— 不是 `Pending`。死結又回來了，只是這次卡在 k8s 看不到的地方。看完用 `kubectl -n pricer rollout undo deploy/model-server` 收回。
 4. **效能非線性。** 見上面那張表。
 
 ### 7.5 隔離強度光譜（面試必考）
@@ -582,7 +593,12 @@ vllm:num_requests_waiting    ─┘
 
 ### 9.3 現在 HPA 才能真的擴容
 
-Phase 0 的 HPA 因為單節點資源不夠，擴容行為是被扭曲的。現在有 time-slicing 的 3 個 GPU 切片，HPA 可以真的從 1 擴到 3：
+Phase 0 的 HPA 因為單節點資源不夠，擴容行為是被扭曲的。現在有 time-slicing，HPA 可以真的從 1 擴到 2。先把上限壓到 2 —— 第 3 個 pod 顯存放不下（Part 7.2），擴上去只會 CrashLoop：
+
+```bash
+kubectl -n pricer patch hpa model-server -p '{"spec":{"maxReplicas":2}}'
+```
+
 
 ```bash
 # 壓測：用 Part 6 開的 bench pod（還沒開的話回去照 Part 6 開一個），直接打 Service
@@ -647,7 +663,7 @@ helm rollback gpu-operator 1 -n gpu-operator        # 回滾
 - [ ] **MAE 跟 Phase 1 的 Docker 版一致**（證明 k8s 這層沒改變行為）
 - [ ] 單卡下的 rollout 死結重現過，且量了選項 A 的停機時間
 - [ ] time-slicing 生效，`nvidia.com/gpu: 3` 出現在節點容量
-- [ ] **「1 pod vs 2 pod vs 3 pod」的吞吐 / p99 / MAE 對照表完成**
+- [ ] **「1 pod vs 2 pod」的吞吐 / p99 / MAE 對照表完成**，並親眼看過第 3 個 pod 排程成功、卻因顯存不夠起不來
 - [ ] **DCGM 的 `GPU_UTIL` vs `SM_ACTIVE` vs `PIPE_TENSOR_ACTIVE` 三個數字都記錄了**
 - [ ] HPA 用 `vllm:num_requests_waiting` 實際擴容（`SuccessfulRescale`）
 - [ ] HPA 門檻已用 Phase 2 的曲線校正過

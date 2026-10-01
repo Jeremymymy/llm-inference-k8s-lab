@@ -8,9 +8,10 @@
 # time-slicing 把這些全部解鎖，而且不用多花錢。
 #
 # 為什麼這個 workload 特別適合示範（不是紙上談兵）：
-#   3B bf16 權重約 6~7GB，而 --max-model-len 512 讓 KV cache 幾乎不佔空間。
-#   L4 有 24GB → 跑 2~3 個 replica（每個 --gpu-memory-utilization 0.3）
-#   是真的跑得起來的。
+#   3B bf16 權重約 6GB，KV cache 又是按需分配、150 token 的請求佔得很少。
+#   L4 有 24GB → 2 個 replica（每個 --gpu-memory-utilization 0.42）是真的跑得起來的。
+#   3 個（每個 0.28 ≈ 6.3 GiB）連權重 + LoRA + CUDA 開銷都放不下 —— 要 3 個得改用 FP8 權重。
+#   宣告成 3 張仍然有用：1 個 replica 做滾動更新時，新舊 pod 會短暫並存。
 #
 # ⚠️ 陷阱（面試一定追問，四個都要能講）：
 #   1. 完全沒有記憶體隔離。兩個 pod 共用同一塊 24GB HBM，而 k8s 對此一無所知。

@@ -173,30 +173,32 @@ mv /models/pricer-lora.gguf.bak /models/pricer-lora.gguf
 
 ---
 
-## 事故 4（Phase 1）：`--max-lora-rank` 的無聲截斷
+## 事故 4（Phase 1）：請求打到 base model —— 無聲的 $110
 
 **這一個跟前三個不同 —— 它不會讓任何東西壞掉。**
 
-**觸發方式**：啟動 vLLM 時不帶 `--max-lora-rank`（用預設值 16），但 adapter 是 r=256
+**觸發方式**：請求的 `model` 欄位用 `base` 而不是 `pricer`（Phase 1 用 `measure.py --model base`；Phase 3 是 pricer-api 的 `MODEL_NAME` 設錯）
 
 ### 現象
 | 檢查項目 | 結果 |
 |---|---|
-| Pod 狀態 | ✅ Running |
+| Pod / 容器狀態 | ✅ Running |
 | startupProbe | ✅ 通過 |
 | readinessProbe | ✅ 通過 |
-| `/v1/models` | ✅ 列出 adapter |
+| `/v1/models` | ✅ 列出 `base` 與 `pricer` |
 | API 回應 | ✅ 200，回傳合法的價格數字 |
-| **MAE** | ❌ 從 $___ 掉到 $___ |
+| **MAE** | ❌ 從 $___ 變成 $___ |
 
 ### 排查路徑
-1. 
-2. 
-3. 
+1.
+2.
+3.
 
 ### 根因
-vLLM 的 `--max-lora-rank` 支援值是 8/16/32/64/128/256/320/512，**預設 16**。
-adapter 的 rank 超過設定值時，vLLM 會**載入它能載的部分**，而不是拒絕啟動。
+同一個 vLLM 服務同時提供 base model 與 LoRA adapter，靠請求裡的 `model` 名稱區分。名稱打成 `base`，vLLM 就照做 —— 對它來說這是一個完全合法的請求。
+
+### 對照：原本以為會無聲、其實很大聲的 `--max-lora-rank`
+一開始預期「不帶 `--max-lora-rank`（預設 16）、adapter 是 r=256」會讓 adapter 被靜靜截斷。實際上 vLLM 啟動時就會驗證 rank，直接拒絕：`LoRA rank 256 is greater than max_lora_rank 16.`（實測訊息：___）。**大聲的錯誤任何一個 probe 都抓得到，危險的是這一篇這種。**
 
 ### 修法
 ```diff

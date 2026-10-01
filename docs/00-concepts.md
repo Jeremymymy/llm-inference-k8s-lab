@@ -88,14 +88,16 @@ KV cache 大小 = 2（K和V） × 層數 × KV head 數 × head_dim × 序列長
 
 關鍵性質：**它隨「序列長度 × 並發數」線性成長**。
 
-這就是為什麼 `--max-model-len` 是最大的效能槓桿：
+**注意是「實際的」序列長度，不是 `--max-model-len`。** 常見的誤解是「max-model-len 設越大，每個請求就預留越多 KV cache」—— 在 vLLM 不成立：它的 KV cache 是按需分配的（見 2.3 PagedAttention），一個 150 token 的請求只佔 150 token 的空間。
 
-| 設定 | 每個序列的 KV cache | 24GB 卡扣掉權重後能跑幾個並發 |
+`--max-model-len` 真正卡住你的地方是**啟動**：KV cache 至少要放得下一條最長的序列。
+
+| 設定 | 一條最長序列的 KV cache（本 lab 的 3B 模型） | 結果 |
 |---|---|---|
-| `--max-model-len 131072`（預設） | 約 14 GiB（本 lab 的 3B 模型） | **0 —— 在 L4 上根本起不來**，一條序列就放不下 |
-| `--max-model-len 512`（本 lab） | 極小 | 數百 |
+| `--max-model-len 131072`（預設） | 約 14 GiB | **在 L4 上很可能起不來**，一條序列就放不下 |
+| `--max-model-len 512`（本 lab） | 約 56 MiB | 起得來；但對 150 token 的請求，它跟 32768 佔的 KV cache 一樣多 |
 
-vLLM 啟動時會把「總記憶體 × `--gpu-memory-utilization` − 權重」全部預先劃給 KV cache，並換算成 **blocks**。啟動 log 會直接印出來，那行是你調校時最該看的數字。［Phase 2 驗證］
+vLLM 啟動時會把「總記憶體 × `--gpu-memory-utilization` − 權重」全部預先劃給 KV cache 當作池子，切成 **blocks**，請求再按需從池子裡拿。啟動 log 會印出容量（`GPU KV cache size: N tokens`），那行是你調校時最該看的數字。［Phase 2 驗證］
 
 ### 2.3 PagedAttention —— vLLM 的招牌
 
@@ -229,7 +231,7 @@ target_modules = q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj�
 
 `r=256` 是相當大的 rank（常見是 8～64）。兩個後果：
 
-1. **vLLM 的 `--max-lora-rank` 預設是 16**。不設成 256 的話，adapter 會被截斷載入 —— 而且服務**不會報錯**。［Phase 1 會刻意重現這個失敗］
+1. **vLLM 的 `--max-lora-rank` 預設是 16**。不設成 256 的話，vLLM **啟動時就會拒絕載入** adapter。［Phase 1 會刻意重現這個失敗，並跟真正無聲的失敗對照］
 2. **runtime LoRA 的 kernel 開銷跟 rank 成正比**。rank 越大，「不 merge 直接跑」的代價越高，把權重 merge 進 base 再 serve 可能反而更快。
 
 ### 5.5 Runtime LoRA vs Merged 權重

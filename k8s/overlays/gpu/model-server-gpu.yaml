@@ -55,15 +55,15 @@ spec:
             - base
             - --enable-lora
             - --lora-modules
-            # ⚠️ 絕對路徑。vLLM 在容器裡吃不到相對路徑，而且是「靜靜失敗」
+            # ⚠️ 容器內的路徑。找不到的話 vLLM 啟動就失敗（LoRAAdapterNotFoundError）
             - pricer=/models/adapter
-            # ⚠️ 不設這個的話 adapter(r=256) 會被截斷載入，服務照常跑但答案是錯的
+            # ⚠️ adapter 是 r=256，預設值 16。不設的話 vLLM 啟動就拒絕載入 adapter
             - --max-lora-rank
             - "256"
-            # 本 workload 最大的效能槓桿，見 Phase 2
+            # 一道防線：超長請求直接拒絕。預設 131072 在 L4 上連啟動都不行（見 docs/05 Part 3）
             - --max-model-len
             - "512"
-            # ⚠️ time-slicing 時這個值要除以同卡上的 pod 數，否則第二個 pod 直接 CUDA OOM
+            # ⚠️ time-slicing 時要除以同卡上的 pod 數，而且每一份都要放得下權重 + 開銷（見 docs/06 Part 7.2）
             - --gpu-memory-utilization
             - "0.85"
           ports:

@@ -65,12 +65,12 @@
 | 未微調的 base model | $110.72 | 「LoRA 沒生效」的指紋 |
 | llama.cpp Q8_0 + LoRA（Mac） | — | Phase 0 |
 | vLLM bf16 + LoRA rank 256 | — | Phase 1 主線 |
-| vLLM bf16 + **預設 rank 16** | — | 刻意重現的無聲失敗 |
+| vLLM bf16 + **預設 rank 16** | — | 刻意重現的大聲失敗（啟動即拒絕） |
 | vLLM bf16 + merged 權重 | — | 應與主線一致 |
 
 ### 效能（g6.xlarge / L4 24GB）
 
-| 設定 | 吞吐 | p95 TTFT | GPU blocks |
+| 設定 | 吞吐 | p95 TTFT | KV cache size |
 |---|---|---|---|
 | `--max-model-len 131072`（預設） | 起不來 | — | — |
 | `--max-model-len 32768` | — | — | — |
