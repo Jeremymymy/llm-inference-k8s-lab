@@ -1,6 +1,7 @@
 # LLM Inference on Kubernetes 實驗室 — 04：Phase 1，雲端 GPU 上的 vLLM
 
 > 成本：**約 $16**（g6.xlarge 累積開機 20 小時 —— 分多次做，每次收工就 `stop`）。這是第一次花錢的階段。
+> **精簡路線**：跟 Phase 2 合併成一輪，粗估約 5–6 小時、約 $5（見下方「精簡路線」）。
 > 產出：vLLM 服務化、正確性對齊 MAE $39.85、以及兩個原創實驗的數據。
 > **刻意不上 k8s。** 理由見下。
 
@@ -30,6 +31,26 @@ nvidia-smi 看得到卡嗎
 5. 刻意失敗：`--max-lora-rank` 與兩種失敗模式
 6. 原創實驗：runtime LoRA vs merged 權重
 7. 四方對照表
+
+---
+
+## 精簡路線：Phase 1＋2 合併成一輪（本 lab 採用）
+
+**這兩個 Phase 用同一台機器，時間主要花在「重啟 vLLM」**（每次都要載權重、編譯）。所以不按文件順序做，而是按「啟動」分組 —— 一次啟動把能做的事全做完，總共 5 次能起來的啟動 + 1 次預期失敗的。粗估開機約 5–6 小時（約 $5，**未實測**）。
+
+| 啟動 | 設定（跟 ① 只差一個旗標） | 這次做完的事 | 出處 |
+|---|---|---|---|
+| ① | Part 3.1 的指令（runtime LoRA、`--max-model-len 512`、`pricer` + `pricer2`） | 量冷啟動時間、記 `KV cache size` / `Maximum concurrency` / `max_num_batched_tokens` 三行 log、MAE（`pricer` 與 `base`）、`/v1/models` 看到三個名字、飽和壓測、request-rate 掃描、瓶頸判讀 | 本文 Part 3–4；Phase 2 Part 2、6.1、7 |
+| ② | `--max-model-len 131072`，**前景** | 只記錯誤訊息（預期起不來） | Phase 2 Part 3.1 第一步 |
+| ③ | `--max-model-len 32768` | 飽和壓測一次，跟 ① 比 | Phase 2 Part 3.1 第二步 |
+| ④ | `--max-num-batched-tokens 8192` | 飽和壓測 + 一個固定 rate，跟 ① 比 | Phase 2 Part 4.3 |
+| — | （停 vLLM）merge LoRA | | 本文 Part 6.1 |
+| ⑤ | merged bf16 | MAE + 飽和壓測 | 本文 Part 6；也是 Phase 2 Part 5 的 bf16 基準 |
+| ⑥ | merged FP8 | MAE + 飽和壓測 + `Model loading took` | Phase 2 Part 5 |
+
+📖 **讀就好、不實跑**：本文 Part 5.1–5.2（`--max-lora-rank` 太小 → 啟動失敗，已從 vLLM 原始碼確認；它的對照組「無聲失敗」在 ① 的 `--model base` 已經量了）、Phase 2 Part 4.1 / 4.2 / 4.4、Phase 2 Part 6.3（同一份 adapter 量 1 vs 2 個，結論太薄）。
+
+**量測次數**：每組「熱身 1 次 + 正式 1 次」，只記正式那次（見 Phase 2 Part 1.2）。
 
 ---
 
@@ -209,8 +230,9 @@ docker run --rm -d --name vllm \
     --model meta-llama/Llama-3.2-3B \
     --served-model-name base \
     --enable-lora \
-    --lora-modules pricer=/adapter \
+    --lora-modules pricer=/adapter pricer2=/adapter \
     --max-lora-rank 256 \
+    --max-loras 2 \
     --max-model-len 512 \
     --gpu-memory-utilization 0.85
 
@@ -227,12 +249,13 @@ docker logs -f vllm            # 等它說 "Application startup complete"
 | `--max-model-len 512` | prompt 約 150 + 輸出 5。預設 131072 在 L4 上很可能連啟動都不行（一條 131072 token 序列的 KV cache 就要約 14 GiB，Phase 2 Part 3 實測）。設 512 也是一道防線：超長的請求直接被拒絕。**它對吞吐的影響其實不大** —— 這跟很多人的直覺相反，Phase 2 會量給你看 |
 | `--gpu-memory-utilization 0.85` | 預先劃給權重 + KV cache 的比例。0.9 是預設，留一點餘裕比較不會在尖峰爆掉 |
 | `-v $HOME/vllm-cache:/root/.cache/vllm` | vLLM 啟動時會做 torch.compile 與 CUDA graph 編譯，結果快取在容器的 `~/.cache/vllm`。容器是 `--rm` 起的，不掛出來的話**每次重啟都要重編** —— Phase 2 每組實驗都要重啟，累積起來很可觀。（快取路徑依 vLLM 版本而異，跑過一次後 `ls ~/vllm-cache` 確認有東西寫進去） |
-| `--served-model-name base` | 讓 base model 和 LoRA 有不同的名字，這樣同一個服務可以兩個都打 —— Part 6 的對照實驗要用 |
+| `--served-model-name base` | 讓 base model 和 LoRA 有不同的名字，這樣同一個服務可以兩個都打 —— Part 4 的 base 對照組要用 |
+| `pricer2=/adapter --max-loras 2` | 同一份 adapter 掛成第二個名字，順便驗證多 LoRA 熱插拔（Phase 2 Part 6），省一次重啟。代價是多佔一份 r=256 的 LoRA 槽位、KV cache 稍小 —— ①③④ 都用這組旗標，彼此仍可比 |
 
 **啟動 log 裡最該看的那兩行**：
 
 ```bash
-docker logs vllm 2>&1 | grep -E "KV cache size|Maximum concurrency"
+docker logs vllm 2>&1 | grep -E "KV cache size|Maximum concurrency|max_num_batched_tokens"
 ```
 
 ```
@@ -251,7 +274,7 @@ Maximum concurrency for 512 tokens per request: 191.41x
 
 ```bash
 curl -s localhost:8000/v1/models | python3 -m json.tool
-# 應該看到 "base" 和 "pricer" 兩個
+# 應該看到 "base"、"pricer"、"pricer2" 三個
 
 curl -s localhost:8000/v1/completions \
   -H 'Content-Type: application/json' \
@@ -329,9 +352,11 @@ uv run --with datasets eval/measure.py \
 
 ---
 
-## Part 5：刻意失敗 —— `--max-lora-rank` 與兩種失敗模式
+## Part 5：刻意失敗 —— `--max-lora-rank` 與兩種失敗模式（📖 精簡路線：5.1–5.2 讀就好，5.3 要懂）
 
-**務必實際做一次。** 但它示範的是「**大聲失敗**」—— 真正危險的是它的反面，這一節要把兩種並排看清楚。
+**精簡路線不實跑 5.1–5.2**：依 vLLM 原始碼（見 5.2 的註），rank 超過上限會在啟動時就丟錯退出，行為明確，跑一次只是多一次重啟。**5.3 的「無聲失敗」對照組已經在 Part 4 的 `--model base` 量過了**，那才是這一節的重點。
+
+它示範的是「**大聲失敗**」—— 真正危險的是它的反面，這一節要把兩種並排看清楚。
 
 ### 5.1 做法：不帶 `--max-lora-rank` 啟動
 
@@ -485,6 +510,8 @@ docker exec vllm vllm bench serve --backend openai --base-url http://localhost:8
 
 成功條件：**兩邊的 MAE 應該幾乎相同**（差異在小數點後），因為數學上是等價的。如果差很多，代表 merge 或載入有問題。
 
+⚠️ **精簡路線的已知混淆變因**：runtime LoRA 那組（合併路線 ①）多帶了 `pricer2 --max-loras 2`，多佔一份 r=256 的 LoRA 槽位、KV cache 稍小。對本 workload（KV cache 用量很低）影響應該不大，但吞吐差距不能 100% 歸給「runtime LoRA vs merged」—— `RESULTS.md` 那一列要註明。
+
 吞吐則可能有明顯差異 —— 那就是你的實驗結果。填進 `RESULTS.md`。
 
 ### ⚠️ 陷阱
@@ -505,7 +532,7 @@ docker exec vllm vllm bench serve --backend openai --base-url http://localhost:8
 | 1 | leaderboard（未微調） | 4-bit | 無 | $110.72 | 「LoRA 沒生效」的指紋 |
 | 2 | Mac / llama.cpp | Q8_0 | GGUF f16 runtime | ? | Phase 0 |
 | 3 | GPU / vLLM | bf16 | runtime, rank 256 | ? | Phase 1 主線 |
-| 4 | GPU / vLLM | bf16 | runtime, **預設 rank 16** | 起不來 | 大聲失敗：記下錯誤訊息 |
+| 4 | GPU / vLLM | bf16 | runtime, **預設 rank 16** | 起不來 | 大聲失敗（精簡路線未實跑，依原始碼推論） |
 | 5 | GPU / vLLM | bf16 | **merged** | ? | 應與 #3 幾乎相同 |
 | 6 | GPU / vLLM | bf16 | 無（base） | ? | 應接近 #1；**無聲失敗**的樣子 |
 
@@ -516,13 +543,13 @@ docker exec vllm vllm bench serve --backend openai --base-url http://localhost:8
 ## Phase 1 驗收清單
 
 - [ ] `nvidia-smi` 看得到 L4，`compute_cap` 是 8.9
-- [ ] vLLM 的 `/v1/models` 同時列出 `base` 與 `pricer`
+- [ ] vLLM 的 `/v1/models` 同時列出 `base`、`pricer`、`pricer2`
 - [ ] 主線 MAE 落在 $36–$45
 - [ ] base model 的對照組 MAE 落在 $105–$115
-- [ ] **預設 `--max-lora-rank` 的啟動錯誤訊息記錄了**，並跟 base 對照組（無聲失敗）並排
+- [ ] （精簡路線跳過）預設 `--max-lora-rank` 的啟動錯誤訊息記錄了，並跟 base 對照組（無聲失敗）並排
 - [ ] merged vs runtime LoRA 的 MAE 幾乎相同（驗證 merge 正確）
 - [ ] 已量並記下 vLLM 的**冷啟動時間**（Phase 3 的 `startupProbe` 要用）
-- [ ] 啟動 log 的 `KV cache size` 與 `Maximum concurrency` 已記下（Phase 2 調校的基準）
+- [ ] 啟動 log 的 `KV cache size`、`Maximum concurrency`、`max_num_batched_tokens` 已記下（Phase 2 調校的基準）
 - [ ] 對照表七行都填完
 - [ ] **機器已 `stop`**
 

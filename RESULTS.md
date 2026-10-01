@@ -1,7 +1,7 @@
 # 實驗數據紀錄
 
 > 邊做邊填。`README.md` 的摘要表從這裡來。
-> **量測規則**：每組跑 3 次取中位數、第一次丟掉（warmup）；一次只改一個變數；正確性與效能必須成對記錄。
+> **量測規則**：每組先熱身 1 次（丟掉），再正式跑 1 次 —— **數字都是單次量測，不是中位數**，差距小於約 5% 不下結論；一次只改一個變數；正確性與效能必須成對記錄。
 
 ---
 
@@ -29,7 +29,7 @@
 |---|---|---|---|---|---|---|---|---|
 | 1 | 2026-09-25 | Mac / llama.cpp | Q8_0 | GGUF f16 runtime | $40.79 | 72.1% | 75.0% | Phase 0；4 次 MAE 完全相同 |
 | 2 | | GPU / vLLM | bf16 | runtime, rank 256 | | | | Phase 1 主線 |
-| 3 | | GPU / vLLM | bf16 | runtime, **預設 rank 16** | 起不來 | — | — | 大聲失敗：備註欄貼啟動錯誤訊息 |
+| 3 | — | GPU / vLLM | bf16 | runtime, **預設 rank 16** | 起不來 | — | — | 大聲失敗；精簡路線未實跑，依 vLLM 原始碼推論 |
 | 4 | | GPU / vLLM | bf16 | merged | | | | 應與 #2 一致 |
 | 5 | | GPU / vLLM | bf16 | 無（base） | | | | 應接近 $110 |
 | 6 | | GPU / vLLM | **FP8** | merged | | | | 量化代價（跟 #4 比） |
@@ -43,7 +43,7 @@
 
 ## 本機 HPA 壓測（Phase 0）
 
-Mac / OrbStack（VM 8 GiB）/ llama.cpp Q8_0 + LoRA，`--parallel 4`。`eval/measure.py --size 200 --workers 30`，打 model-server Service（docs/02 9.4）。**各跑一次，未照 3 次取中位數**：這裡驗證的是 HPA 機制，不是效能數字。
+Mac / OrbStack（VM 8 GiB）/ llama.cpp Q8_0 + LoRA，`--parallel 4`。`eval/measure.py --size 200 --workers 30`，打 model-server Service（docs/02 9.4）。**各跑一次，沒有熱身**：這裡驗證的是 HPA 機制，不是效能數字。
 
 | label | MAE | R² | Hit rate | p50 (ms) | p95 (ms) | req/s | 備註 |
 |---|---|---|---|---|---|---|---|
@@ -56,14 +56,20 @@ Mac / OrbStack（VM 8 GiB）/ llama.cpp Q8_0 + LoRA，`--parallel 4`。`eval/mea
 
 g6.xlarge / NVIDIA L4 24GB。工具：`vllm bench serve`，`--random-input-len 150 --random-output-len 5`。
 
-### `--max-model-len` 的影響（預期：131072 起不來，其餘三組吞吐差不多 —— KV cache 按需分配）
+### `--max-model-len` 的影響（預期：131072 起不來，其餘兩組吞吐差不多 —— KV cache 按需分配）
 
 | `--max-model-len` | KV cache size (tokens) | Maximum concurrency | 飽和吞吐 (req/s) | p50 TTFT | p95 TTFT | p99 TTFT |
 |---|---|---|---|---|---|---|
 | 131072（預設） | 起不來？ | | | | | |
 | 32768 | | | | | | |
-| 4096 | | | | | | |
 | 512 | | | | | | |
+
+### `--max-num-batched-tokens` 的影響（其餘同 512 那組）
+
+| `--max-num-batched-tokens` | 飽和吞吐 (req/s) | 固定 rate ___ req/s 下的 p99 TTFT | 備註 |
+|---|---|---|---|
+| 預設（log 讀到：___；預期 2048） | | | |
+| 8192 | | | |
 
 ### request-rate 掃描（找 SLA 轉折點）
 
@@ -87,6 +93,8 @@ g6.xlarge / NVIDIA L4 24GB。工具：`vllm bench serve`，`--random-input-len 1
 | AWQ（選作） | | | | |
 
 ### runtime LoRA vs merged（原創實驗，r=256）
+
+> runtime 那列是用 `--max-loras 2`（多掛 `pricer2`）量的，比 merged 多一個變因（docs/04 Part 6.3）。
 
 | 方式 | MAE | 飽和吞吐 | p95 TTFT | 可熱插拔 |
 |---|---|---|---|---|

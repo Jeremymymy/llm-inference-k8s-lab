@@ -50,7 +50,7 @@ Phase 1 結束時你有一個「會動而且答案正確」的服務。Phase 2 �
 
 **四條規則，違反任何一條數字就不可比：**
 
-1. **每組跑 3 次取中位數，第一次丟掉**（CUDA graph warmup、cache 冷）
+1. **每組先熱身 1 次（丟掉），再正式跑 1 次**（熱身是為了 CUDA graph warmup、cache 冷）。⚠️ 這是時間考量下的放寬：單次量測沒有變異數，**差距小於約 5% 的不要下結論**，`RESULTS.md` 要註明是單次
 2. **固定資料集切片與隨機種子**，不同組才可比
 3. **同時記正確性（MAE）與效能**。只有效能沒有正確性的數字沒有意義 —— 你可以讓一個完全答錯的服務跑得飛快
 4. **一次只改一個變數**。同時改 `--max-model-len` 和 `--max-num-seqs`，你就不知道是誰的功勞
@@ -147,7 +147,9 @@ docker run --rm --name vllm --gpus all --ipc=host -p 8000:8000 \
   -e "HF_TOKEN=$HF_TOKEN" \
   vllm/vllm-openai:latest \
     --model meta-llama/Llama-3.2-3B \
-    --enable-lora --lora-modules pricer=/adapter --max-lora-rank 256 \
+    --served-model-name base \
+    --enable-lora --lora-modules pricer=/adapter pricer2=/adapter \
+    --max-lora-rank 256 --max-loras 2 \
     --max-model-len 131072 \
     --gpu-memory-utilization 0.85
 ```
@@ -163,29 +165,32 @@ Try increasing `gpu_memory_utilization` or decreasing `max_model_len` ...
 
 **把 X 和 NNNNN 記進 `RESULTS.md`。** 為什麼會這樣，見 3.2 的算式。
 
-> 如果它**起來了**（例如新版 vLLM 改了行為），那就照原計畫把 131072 當「大」那一組，下面的迴圈把 32768 換回 131072。
+> 如果它**起來了**（例如新版 vLLM 改了行為），那就照原計畫把 131072 當「大」那一組，第二步的 32768 直接換成 131072。
 
-**第二步：跑三組能起來的，只改這一個參數**：
+**第二步：用 Phase 1 ① 的完整指令，只把 `--max-model-len` 改成 32768**，跟 ①（512）比。精簡路線不跑 4096：兩個端點差 64 倍，夠判斷「有沒有影響」了。
 
 ```bash
-for mml in 32768 4096 512; do
-  docker stop vllm 2>/dev/null
-  docker run --rm -d --name vllm --gpus all --ipc=host -p 8000:8000 \
-    -v "$HF_HOME:/root/.cache/huggingface" \
-    -v "$HOME/vllm-cache:/root/.cache/vllm" \
-    -v /home/ubuntu/adapter:/adapter:ro \
-    -e "HF_TOKEN=$HF_TOKEN" \
-    vllm/vllm-openai:latest \
-      --model meta-llama/Llama-3.2-3B \
-      --enable-lora --lora-modules pricer=/adapter --max-lora-rank 256 \
-      --max-model-len $mml \
-      --gpu-memory-utilization 0.85
+docker stop vllm 2>/dev/null
+docker run --rm -d --name vllm --gpus all --ipc=host -p 8000:8000 \
+  -v "$HF_HOME:/root/.cache/huggingface" \
+  -v "$HOME/vllm-cache:/root/.cache/vllm" \
+  -v /home/ubuntu/adapter:/adapter:ro \
+  -e "HF_TOKEN=$HF_TOKEN" \
+  vllm/vllm-openai:latest \
+    --model meta-llama/Llama-3.2-3B \
+    --served-model-name base \
+    --enable-lora --lora-modules pricer=/adapter pricer2=/adapter \
+    --max-lora-rank 256 --max-loras 2 \
+    --max-model-len 32768 \
+    --gpu-memory-utilization 0.85
 
-  # 等就緒：輪詢 /health，而不是固定 sleep（編譯時間每次不同）。
-  # 最多等 15 分鐘 —— 容器起不來的話會被 --rm 刪掉，沒有 timeout 迴圈會卡死。
-  timeout 900 bash -c 'until curl -sf localhost:8000/health >/dev/null; do sleep 5; done' \
-    || { echo "max-model-len=$mml 沒起來，改用前景模式重跑看錯誤"; continue; }
-  docker logs vllm 2>&1 | grep -E "KV cache size|Maximum concurrency"
+# 等就緒：輪詢 /health，而不是固定 sleep（編譯時間每次不同）。
+# 最多等 15 分鐘 —— 容器起不來的話會被 --rm 刪掉，沒有 timeout 會卡死。
+timeout 900 bash -c 'until curl -sf localhost:8000/health >/dev/null; do sleep 5; done' \
+  || echo "沒起來，改用前景模式（拿掉 -d）重跑看錯誤"
+docker logs vllm 2>&1 | grep -E "KV cache size|Maximum concurrency"
+# 熱身 1 次 + 正式 1 次（Part 1.2），只記第二次
+for i in 1 2; do
   docker exec vllm vllm bench serve --backend openai --base-url http://localhost:8000 \
     --model pricer --tokenizer meta-llama/Llama-3.2-3B --dataset-name random \
     --random-input-len 150 --random-output-len 5 \
@@ -236,12 +241,11 @@ L4 可用記憶體        ≈ 22.5 GiB × 0.85 ≈ 19 GiB
 |---|---|---|---|---|
 | 131072（預設） | — | — | — | **起不來**：一條序列的 KV cache 就超過可用記憶體 |
 | 32768 | ≈ 相同 | 小 | ≈ 相同 | KV cache 按需分配，max-model-len 不預留空間 |
-| 4096 | ≈ 相同 | 中 | ≈ 相同 | |
 | 512 | ≈ 相同 | **大** | ≈ 相同 | 只有「最壞情況估計」變大 |
 
-**如果你量到三組吞吐幾乎一樣，那不是你做錯了，那就是正確答案。** 跟 Part 5 的量化一樣，這是一個比「調了變快 N 倍」更有價值的結論：它證明你理解 PagedAttention，而不是在背調校清單。
+**如果你量到兩組吞吐幾乎一樣，那不是你做錯了，那就是正確答案。** 跟 Part 5 的量化一樣，這是一個比「調了變快 N 倍」更有價值的結論：它證明你理解 PagedAttention，而不是在背調校清單。
 
-**如果三組真的差很多**，先看 `KV cache size` 那行有沒有跟著變。有的話，代表這版 vLLM 的記憶體估算還是受 max-model-len 影響（例如 chunked prefill 被關掉了）。把 log 貼進 `RESULTS.md` —— 那也是一個值得記的發現。
+**如果兩組真的差很多**，先看 `KV cache size` 那行有沒有跟著變。有的話，代表這版 vLLM 的記憶體估算還是受 max-model-len 影響（例如 chunked prefill 被關掉了）。把 log 貼進 `RESULTS.md` —— 那也是一個值得記的發現。
 
 **真正能動吞吐的旋鈕在 Part 4**（`--max-num-batched-tokens`、`--max-num-seqs`）。
 
@@ -258,7 +262,7 @@ L4 可用記憶體        ≈ 22.5 GiB × 0.85 ≈ 19 GiB
 ### 4.1 `--gpu-memory-utilization`
 
 ```bash
-# 預設 0.9。試 0.80 / 0.90 / 0.95
+# 📖 精簡路線讀就好。預設 0.9。試 0.80 / 0.90 / 0.95
 ```
 
 | 值 | 效果 | 風險 |
@@ -271,7 +275,9 @@ L4 可用記憶體        ≈ 22.5 GiB × 0.85 ≈ 19 GiB
 
 ### 4.2 `--max-num-seqs`
 
-同時在跑的序列數上限。調大 → 吞吐↑、個別延遲↑。
+📖 精簡路線讀就好。
+
+同時在跑的序列數上限。調大 → 吞吐↑、個別延遲↑。L4 這級的卡（顯存 < 70 GiB）預設是 256（依 vLLM 原始碼 `vllm/engine/arg_utils.py`）。
 
 對本 workload（極短輸出），這個值可以開得很大。試 `64 / 256 / 1024`，看吞吐在哪裡飽和。
 
@@ -283,11 +289,16 @@ L4 可用記憶體        ≈ 22.5 GiB × 0.85 ≈ 19 GiB
 
 代價是：一輪的時間變長，正在 decode 的請求要等更久 → **p99 會變差**。
 
-**這就是 throughput 與 latency 的張力最直接的體現。** 把「`--max-num-batched-tokens` vs 吞吐 vs p99」量成一條曲線，這是很有說服力的面試素材。
+**這就是 throughput 與 latency 的張力最直接的體現。**
+
+**精簡路線實跑這一個旋鈕**（Phase 1 合併路線的 ④）：
+- 預設值看 ① 的啟動 log：`docker logs vllm 2>&1 | grep max_num_batched_tokens`（印 `Chunked prefill is enabled with max_num_batched_tokens=N`）。依 vLLM 原始碼，顯存 < 70 GiB 的卡在 API server 模式預設 **2048**（未實測）—— 也就是一輪最多 prefill 約 13 個 150-token 的請求
+- 用 ① 的完整指令加 `--max-num-batched-tokens 8192`（約 54 個）重啟，跑一次飽和（`--request-rate inf`）和一個固定 rate（取 ① 掃描曲線上翹前的那個點），跟 ① 比吞吐與 p99 TTFT
+- 吞吐上去、p99 變差 → 典型取捨；吞吐不變 → 代表瓶頸不在批次大小（對照 Part 7 的判讀表）。**兩種都是可以寫進 `RESULTS.md` 的結論**
 
 ### 4.4 `--enforce-eager`
 
-關掉 CUDA graph。
+📖 精簡路線讀就好。關掉 CUDA graph。
 
 | | CUDA graph（預設） | `--enforce-eager` |
 |---|---|---|
@@ -364,6 +375,8 @@ docker logs vllm 2>&1 | grep -E "Model loading took|KV cache size"
 
 ### 6.1 做法
 
+> **精簡路線**：Phase 1 合併路線的 ① 已經帶著 `pricer2=/adapter --max-loras 2` 起來了，不用另外重啟，直接跑下面的 `curl` 就好。底下的完整指令留作參考。
+
 ```bash
 docker run --rm -d --name vllm --gpus all --ipc=host -p 8000:8000 \
   -v "$HF_HOME:/root/.cache/huggingface" \
@@ -403,7 +416,7 @@ print([m['id'] for m in json.load(sys.stdin)['data']])"
 
 **on-prem 的容量是固定的**（雲端可以再開一台，地端不行），所以這種省法的價值比在雲端高得多。
 
-### 6.3 要量的東西
+### 6.3 要量的東西（📖 精簡路線讀就好）
 
 | 情境 | 吞吐 | p95 TTFT |
 |---|---|---|
@@ -476,10 +489,11 @@ docker exec vllm vllm bench serve ...
 ## Phase 2 驗收清單
 
 - [ ] 預設 131072 的啟動結果記錄了（起不來的話，記下錯誤訊息裡的可用 KV cache 與 estimated maximum model length）
-- [ ] `--max-model-len` 三組（32768 / 4096 / 512）的 `KV cache size`、`Maximum concurrency` 與吞吐都記錄了
+- [ ] `--max-model-len` 兩組（32768 / 512）的 `KV cache size`、`Maximum concurrency` 與吞吐都記錄了
+- [ ] `--max-num-batched-tokens` 預設值（從 log 讀）vs 8192 的吞吐與 p99 TTFT 記錄了
 - [ ] request-rate 掃描曲線畫出來了，找到 p99 開始上翹的轉折點
 - [ ] 量化對照表至少有 bf16 與 FP8 兩組，**每組都有 MAE 和吞吐**
-- [ ] 多 LoRA 同時服務兩個 adapter 成功，且量了 1 vs 2 的差異
+- [ ] 多 LoRA：`/v1/models` 列出 `pricer` 與 `pricer2`，兩個都打得通（1 vs 2 的效能差異精簡路線跳過）
 - [ ] 能用三個訊號（GPU util / KV cache / 佇列）說出當前是哪種瓶頸，**並附上截圖或數字**
 - [ ] 所有數字進了 `RESULTS.md`
 - [ ] **機器已 `stop`**
@@ -490,7 +504,7 @@ docker exec vllm vllm bench serve ...
 
 在 `92-interview.md` 裡補上這段（把問號換成你的實際數字）：
 
-> 「我的 workload 是 prefill 主導的（輸入 150 token、輸出 5 token）。很多人以為 `--max-model-len` 是最大的槓桿，我實測的結果是：預設的 131072 在 L4 上根本起不來（一條序列的 KV cache 就要 14GB），但能起來的 32768、4096、512 三組吞吐只差 ?% —— 因為 vLLM 的 KV cache 是按需分配的，max-model-len 不會預留空間，它只影響啟動檢查和『最大並發』那行最壞情況的估計。真正的瓶頸是算力：壓測時 GPU util ?%、KV cache 使用率只有 ?%，但佇列還是在長。FP8 量化把權重從 6.4GB 降到 ?GB，但吞吐只提升 ?% —— 因為量化省的是記憶體頻寬，而 prefill 是 compute-bound。」
+> 「我的 workload 是 prefill 主導的（輸入 150 token、輸出 5 token）。很多人以為 `--max-model-len` 是最大的槓桿，我實測的結果是：預設的 131072 在 L4 上根本起不來（一條序列的 KV cache 就要 14GB），但能起來的 32768 和 512 兩組吞吐只差 ?% —— 因為 vLLM 的 KV cache 是按需分配的，max-model-len 不會預留空間，它只影響啟動檢查和『最大並發』那行最壞情況的估計。真正的瓶頸是算力：壓測時 GPU util ?%、KV cache 使用率只有 ?%，但佇列還是在長。FP8 量化把權重從 6.4GB 降到 ?GB，但吞吐只提升 ?% —— 因為量化省的是記憶體頻寬，而 prefill 是 compute-bound。」
 
 ---
 

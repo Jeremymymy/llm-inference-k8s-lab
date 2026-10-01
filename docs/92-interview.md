@@ -41,7 +41,7 @@
 
 > 「我的 workload 是 **prefill 主導**的：輸入約 150 token、輸出只有 5 token。這個特性推翻了很多 LLM 推論的『常識』。
 >
-> 很多人以為 `--max-model-len` 是最大的槓桿，我實測的結果是：預設的 131072 在 L4 上根本起不來 —— 一條 131072 token 序列的 KV cache 就要約 14GB，比扣掉權重後的可用空間還大，vLLM 直接拒絕啟動。但能起來的 32768、4096、512 三組，吞吐只差 ?%。因為 vLLM 的 KV cache 是按需分配的（PagedAttention），max-model-len 不會替每個請求預留空間 —— 它只影響啟動檢查，和 log 裡『最大並發』那個最壞情況的估計。
+> 很多人以為 `--max-model-len` 是最大的槓桿，我實測的結果是：預設的 131072 在 L4 上根本起不來 —— 一條 131072 token 序列的 KV cache 就要約 14GB，比扣掉權重後的可用空間還大，vLLM 直接拒絕啟動。但能起來的 32768 和 512 兩組，吞吐只差 ?%。因為 vLLM 的 KV cache 是按需分配的（PagedAttention），max-model-len 不會替每個請求預留空間 —— 它只影響啟動檢查，和 log 裡『最大並發』那個最壞情況的估計。
 >
 > 量化的結果也是反直覺的：FP8 把權重從 6.4GB 降到 ?GB，但吞吐只提升了 ?%。因為量化省的是**記憶體頻寬**，而 prefill 是 compute-bound。不過權重變小本身有價值 —— 在一張卡上跑多個 replica 時，真正的限制是「每個 pod 都要一份權重」，不是 KV cache。」
 
@@ -147,6 +147,27 @@
 2. `RESULTS.md` —— **把你自己的數字記熟**，講不出數字的專案敘事沒有說服力
 3. `POSTMORTEMS.md` —— 三個故障的排查路徑
 4. `KNOWN-GAPS.md` —— 知道自己的邊界在哪，被問到時能大方承認
+
+---
+
+## 六、沒實跑、但要講得出來的陷阱（精簡路線 📖 項目）
+
+面試被問到時，誠實說「這個我沒親手做，但我知道陷阱在哪」，然後講下面那句。**不要說成做過。**
+
+| 主題 | 一句話 | 出處 |
+|---|---|---|
+| RWX / 模型分發 | RWX 不適合模型權重：唯讀大檔、啟動時順序讀一次 → 用內部物件儲存 + initContainer 拉到 local PV；NFS 會變成頻寬瓶頸與單點故障 | docs/03 Part 3 |
+| `volumeBindingMode` | local PV 必須 `WaitForFirstConsumer`，`Immediate` 會把 PV 建在沒有 GPU 的節點上 | docs/03 Part 3.5 |
+| MetalLB | on-prem 的 LoadBalancer 會一直 `<pending>`；MetalLB 的 L2 模式是**故障轉移不是負載平衡**（流量全走一個節點），要真分流得用 BGP | docs/03 Part 4 |
+| CronJob | `concurrencyPolicy` 預設 `Allow` 會越積越多；不設 `startingDeadlineSeconds` 停機後會補跑；沒有 `ttlSecondsAfterFinished` 會讓 etcd 膨脹 | docs/03 Part 10 |
+| NetworkPolicy | CNI 不執行時 apply 成功但完全沒效果（kindnet 就是）；model-server 適合幾乎全封，只放 pricer-api 進、DNS 出 | docs/03 Part 11 |
+| `--max-lora-rank` | 預設 16，adapter 是 r=256 → vLLM **啟動就失敗**（大聲失敗，好處理）。危險的是反面：請求打到 base，一切綠燈但 MAE 變 $110 | docs/04 Part 5 |
+| `--gpu-memory-utilization` | time-slicing 時每個 pod 的值要除以 pod 數，而且每份都要放得下權重 + 開銷；k8s 對顯存一無所知 | docs/05 Part 4.1 |
+| `--max-num-seqs` | 同時跑的序列上限，調大吞吐↑、個別延遲↑；L4 這級的卡預設 256 | docs/05 Part 4.2 |
+| `--enforce-eager` | 關 CUDA graph：啟動快、執行慢；只在 debug 或啟動時間敏感時用 | docs/05 Part 4.4 |
+| `/dev/shm` | k8s 預設 64MB，vLLM 負載一上來就 crash → `emptyDir: {medium: Memory}`，而且它算進記憶體 limit | docs/06 Part 5 |
+| time-slicing 第 3 個 pod | `nvidia.com/gpu: 3` 讓第 3 個 pod **排程成功**，然後因顯存不夠 CrashLoop —— 死結還在，只是卡在 k8s 看不到的地方 → 這是 MIG 存在的理由 | docs/06 Part 7.4 |
+| Helm | `helm upgrade` 不更新 CRD；`--set` 蓋過 `-f`；`uninstall` 不刪 CRD 與 PVC | docs/06 Part 10 |
 
 ---
 

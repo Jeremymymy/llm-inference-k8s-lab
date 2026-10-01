@@ -35,6 +35,30 @@ Phase 0 用 OrbStack 很方便，但方便是有代價的 —— **有三件事�
 
 ---
 
+## 精簡路線（本 lab 採用）
+
+**只做「親眼看到才算數」的部分**，約 3–4 小時。其餘標 📖 的 Part 讀懂、能講就好 —— 它們的價值在取捨表，不在指令。
+
+| Part | 精簡路線 | 理由 |
+|---|---|---|
+| 1. 三節點叢集 | ✅ 必做 | |
+| 2. RWO 跨節點失敗 | ✅ 必做 | 本 Phase 最重要的一項，15 分鐘 |
+| 3. RWX / NFS | 📖 讀就好 | 要裝 NFS + CSI、再搬一次 3.4GB、處理 uid 權限，最花時間；重點是 3.2–3.5 的取捨表 |
+| 4. MetalLB | 📖 讀就好 | 重點是「L2 模式是故障轉移不是負載平衡」，這是知識不是操作 |
+| 5. taint / affinity / spread | ✅ 必做 | 很快 |
+| 6. drain + PDB 兩難 | ✅ 必做 | 很快，面試題 |
+| 7. ResourceQuota | ✅ 必做 | 重點是跟 Part 8 對照「admission 擋 vs scheduling 擋」 |
+| 8. 假 GPU | ✅ 必做 | |
+| 9. PriorityClass 搶佔 | ✅ 必做 | 資源分配最好的實證 |
+| 10. Job / CronJob | 📖 讀就好 | Job 在 Part 9 已經實際跑過 |
+| 11. NetworkPolicy | 📖 讀就好 | 要砍叢集換 Calico 重建 |
+
+**跳過 Part 3 的連帶影響**：PVC 維持 RWO（kind 的 local-path），PV 綁死在 Part 1 `loader` 被排到的節點上。所以 Part 1 的 `loader` 用 nodeSelector 固定在 GPU 節點 —— 否則 Part 5 的 `nodeSelector` 會把 model-server 送到 PV 不在的節點，永遠 `Pending`。
+
+**全程不要 `kubectl apply -k k8s/overlays/local`**：Part 2 之後的設定都是 `kubectl patch` 上去的，apply 會把 Deployment 還原成 base，全部洗掉。
+
+---
+
 ## Part 1：開三節點叢集
 
 ### 1.1 做法
@@ -78,6 +102,7 @@ apiVersion: v1
 kind: Pod
 metadata: { name: loader }
 spec:
+  nodeSelector: { node-role.pricer/gpu: "true" }   # 讓 PV 建在 GPU 節點上，理由見下
   containers:
     - name: shell
       image: busybox:1.37
@@ -97,7 +122,7 @@ kubectl -n pricer get pods -w      # model-server 第一次啟動會下載 3.4GB
 ```
 
 > 這裡先手動建的 PVC 跟 base 裡的定義一模一樣，所以接下來的 `apply -k` 不會衝突。
-> kind 的預設 StorageClass 是 `WaitForFirstConsumer`：PV 會建在 `loader` 被排到的那個節點上，之後 model-server 也會被綁到那個節點 —— 這正是 Part 2 要觀察的東西。
+> kind 的預設 StorageClass 是 `WaitForFirstConsumer`：PV 會建在 `loader` 被排到的那個節點上，之後 model-server 也會被綁到那個節點 —— 這正是 Part 2 要觀察的東西。`loader` 加 nodeSelector 是為了讓這個節點剛好是 GPU 節點，Part 5 之後的 nodeSelector 才不會跟 PV 打架。
 
 ### 1.2 為什麼是 kind 而不是別的
 
@@ -121,7 +146,7 @@ kubectl -n pricer get pods -w      # model-server 第一次啟動會下載 3.4GB
   | 一個 model-server + 叢集 | 約 6.5 GiB —— 8 GiB 塞得下 |
   | **兩個 model-server + 叢集** | **約 11 GiB —— 8 GiB 塞不下** |
 
-  Part 3（RWX，兩個 replica 分散在兩個節點）和 Part 5 / 8 / 9（改 pod template 觸發 rollout，新舊 pod 短暫並存）都會同時跑兩個 llama-server，所以要調到 12 GiB。代價是 macOS 只剩約 4GB，做這個 Phase 時先關掉瀏覽器等吃記憶體的程式。
+  Part 5 / 8 / 9（改 pod template 觸發 rollout，新舊 pod 短暫並存）會同時跑兩個 llama-server，所以要調到 12 GiB（選作的 Part 3 兩個 replica 也是）。代價是 macOS 只剩約 4GB，做這個 Phase 時先關掉瀏覽器等吃記憶體的程式。
 - **scheduler 看到的記憶體是假的。** kind 節點容器沒有記憶體上限，所以**每個節點的 kubelet 都把整台 VM 的記憶體當成自己的 allocatable**。scheduler 以為兩個 worker 各有 12 GiB，會很放心地一邊放一個 model-server —— 實際上它們搶的是同一份 12 GiB。超過時不是 pod 被 `OOMKilled`，而是整台 VM **System OOM**，被砍的可能是任何行程（見 `POSTMORTEMS.md` 事故 1 最後一段）。真實叢集的節點是獨立機器，不會有這個問題 —— **這是 kind 的限制，不是 k8s 的行為**。
 - **不要同時開 OrbStack k8s 和 kind。** 兩個叢集搶同一台 VM。切換時 `orb stop k8s`。
 - **image 要手動 load。** `kind load docker-image` 這一步 Phase 0 沒有（OrbStack 直接共用 Docker 的 image store）。忘了做的話 pod 會卡在 `ErrImageNeverPull`。
@@ -211,11 +236,20 @@ Warning  FailedAttachVolume  Multi-Attach error for volume "pvc-xxxx"
 
 **這個失敗在單節點上永遠不會出現，所以它是「在我機器上可以跑」的經典案例。** 面試時被問「你怎麼確認你的 manifest 在真實叢集會動」，這就是你的答案。
 
-**先別還原**，Part 3 要繼續用這個壞掉的狀態。
+**還原**（精簡路線跳過 Part 3，直接收回這個壞掉的狀態）：
+
+```bash
+kubectl -n pricer scale deploy/model-server --replicas=1       # 先縮：反過來做的話，undo 後會短暫起第 2 個 llama-server
+kubectl -n pricer rollout undo deploy/model-server            # 收回 anti-affinity（pod template 回到上一版）
+kubectl -n pricer rollout status deploy/model-server
+kubectl -n pricer get pods -l app=model-server -o wide         # 1 個 Running，在 GPU 節點上
+```
+
+> 要做選作的 Part 3 的話，**先別還原**，Part 3 要繼續用這個壞掉的狀態。
 
 ---
 
-## Part 3：RWX 與模型分發的真實取捨
+## Part 3：RWX 與模型分發的真實取捨（📖 精簡路線讀就好）
 
 **目的**：解決 Part 2 的問題，順便面對 on-prem 最常被問的架構題。
 
@@ -396,7 +430,7 @@ volumeBindingMode: WaitForFirstConsumer   # vs Immediate
 
 ---
 
-## Part 4：MetalLB —— on-prem 的 LoadBalancer
+## Part 4：MetalLB —— on-prem 的 LoadBalancer（📖 精簡路線讀就好）
 
 **目的**：OrbStack 直接給你 LoadBalancer，讓你學不到 on-prem 的真實狀況。
 
@@ -855,7 +889,7 @@ preemptionPolicy: Never          # ← 這行很重要
 
 ---
 
-## Part 10：Job / CronJob 做離線評估
+## Part 10：Job / CronJob 做離線評估（📖 精簡路線讀就好）
 
 **目的**：batch 推論是 LLM 平台的真實需求（離線評估、資料集標註、embedding 重算），而且它天然就是上一節那個被搶佔的角色。
 
@@ -905,7 +939,7 @@ startingDeadlineSeconds: 300 # 錯過排程時間超過 5 分鐘就放棄這一�
 
 ---
 
-## Part 11：NetworkPolicy（視 CNI 而定）
+## Part 11：NetworkPolicy（視 CNI 而定；📖 精簡路線讀就好）
 
 **先驗證你的 CNI 到底會不會執行它**（做法同 Phase 0 Part 2 的那段測試）。
 
@@ -957,15 +991,15 @@ spec:
 
 - [ ] 三節點叢集跑起來，`kubectl get nodes` 看到 3 個 Ready
 - [ ] **親眼看到 RWO 讓另一個節點的 pod 起不來**，並記下實際的錯誤訊息（kind 上預期是 `volume node affinity conflict`；這是本 Phase 最重要的一項）
-- [ ] RWX 的 PVC 讓兩個 replica 分散在不同節點上都掛載成功
-- [ ] MetalLB 給 LoadBalancer 發出真實 IP，且 `curl` 得通
+- [ ] （選作，精簡路線跳過）RWX 的 PVC 讓兩個 replica 分散在不同節點上都掛載成功
+- [ ] （選作，精簡路線跳過）MetalLB 給 LoadBalancer 發出真實 IP，且 `curl` 得通
 - [ ] taint 造成 `FailedScheduling`，加上 toleration + nodeSelector 後恢復
 - [ ] `drain` 被 PDB 擋住（單 replica + minAvailable: 1）
 - [ ] 超出 ResourceQuota 時 pod 被拒絕，events 裡看得到 `exceeded quota`
 - [ ] 假的 `example.com/gpu` 讓 pod 在超額時 `FailedScheduling`，並對照過 `exceeded quota` 的差別
 - [ ] **`kubectl get events` 看到 `Preempted`**
-- [ ] batch Job 的 `completions` / `parallelism` 正常分片完成
-- [ ] 已確認並記錄 kind 的 CNI 是否執行 NetworkPolicy
+- [ ] batch Job 確實以 `parallelism: 3` 平行分片執行、陸續有 pod `Completed`（Part 9 跑的那個 Job 就算；在 CPU 上整個 Job 可能跑不完 60 個分片就撞到 `activeDeadlineSeconds`，不要求跑完）
+- [ ] （選作，精簡路線跳過）已確認並記錄 kind 的 CNI 是否執行 NetworkPolicy
 
 ---
 

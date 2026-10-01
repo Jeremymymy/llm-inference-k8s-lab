@@ -77,6 +77,7 @@
 | HPA 一直震盪擴縮 | 沒設 `behavior.scaleUp.stabilizationWindowSeconds` | 設成 > 冷啟動時間（本 lab 是 180 秒） |
 | CPU HPA 永遠不觸發 | **這是正確行為，不是 bug** | LLM 的瓶頸不是 CPU。改用 `num_requests_waiting` 這類佇列指標 |
 | `/metrics` 是 404 或空的 | llama.cpp 的 metrics **預設是關的** | 加 `--metrics` 旗標 |
+| DCGM exporter 抓不到 `DCGM_FI_PROF_SM_ACTIVE`（`GPU_UTIL`、`PIPE_TENSOR_ACTIVE` 都有） | GPU Operator 預設的 `dcp-metrics-included.csv` 把它**註解掉了**，不會報錯 | 自訂 ConfigMap（key 必須是 `dcgm-metrics.csv`）+ patch `clusterpolicy` 的 `spec.dcgmExporter.config.name`，見 docs/06 Part 8.1。exporter image 是 distroless，不能 `exec cat` 拿原始清單 |
 
 ---
 

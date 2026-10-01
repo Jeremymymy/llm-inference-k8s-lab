@@ -49,9 +49,9 @@
 | 4. 部署 gpu overlay + MAE 對齊 | ✅ 必做 | **證明 k8s 這層沒改變行為**，MAE 要跟 Phase 1 一樣 |
 | 5. `/dev/shm` | 📖 讀就好 | base 已經擋掉了；知道原因、能講就夠，不必故意弄壞 |
 | 6. 單卡 rollout 死結 | ✅ 必做 | 量出停機秒數，這是選項 A 的真實成本 |
-| 7. time-slicing | ✅ 必做 | 1 / 2 pod 的吞吐、p99、MAE 表 —— 整個 lab 最有說服力的一張表 |
-| 8. DCGM | ✅ 必做 | `GPU_UTIL` vs `SM_ACTIVE` vs `PIPE_TENSOR_ACTIVE`，區辨度最高 |
-| 9. 可觀測性 + HPA | ⏭️ 可選 | 要裝整套 Prometheus stack，最花時間；HPA 的抽象層設計 Phase 0 已經練過 |
+| 7. time-slicing | ✅ 必做 | 1 / 2 pod 的吞吐、p99、MAE 表 —— 整個 lab 最有說服力的一張表。7.4 第 3 點的 CrashLoop 示範 📖 讀就好 |
+| 8. DCGM | ✅ 必做 | `GPU_UTIL` vs `SM_ACTIVE` vs `PIPE_TENSOR_ACTIVE`，區辨度最高。⚠️ `SM_ACTIVE` 預設沒開，要先做 8.1 的 ConfigMap |
+| 9. 可觀測性 + HPA | ⏭️ 跳過 | 跟 Phase 0 重複（Prometheus、prometheus-adapter、HPA 都在 Phase 0 實跑過），又要再裝整套 stack，最花時間 |
 | 10. Helm 實務 | 📖 讀就好 | 那幾個指令與陷阱讀過、能講就夠 |
 
 **bench pod 在 Part 6 建立**，Part 7 的對照表和 Part 8 的 DCGM 觀察都用它產生壓測負載（指令見 Part 9.3 的 `kubectl exec bench -- vllm bench serve ...`，只借那一段，不用裝 Prometheus）。做完 Part 8 就 `kubectl -n pricer delete pod bench`。
@@ -469,7 +469,7 @@ L4 顯存（nvidia-smi 顯示）        ≈ 22.5 GiB
 
 1. **完全沒有記憶體隔離。** 兩個 pod 共用同一塊 24GB HBM，**k8s 對此一無所知**。兩個 pod 都用預設的 `--gpu-memory-utilization 0.9` → 第二個直接 CUDA OOM。這是最常見的翻車點。
 2. **沒有故障隔離。** 一個 pod 觸發 XID error，同卡上所有 pod 一起死。
-3. **`nvidia.com/gpu: 3` 是謊報。** scheduler 以為有三張卡，對記憶體壓力毫無感知。**這正是 production 要用 MIG 的理由。** 親眼看一次：2 個 replica 時再 `rollout restart`，第 3 個 pod 會**排程成功**（拿到第 3 個切片），然後在啟動時因為顯存不夠而 CrashLoop —— 不是 `Pending`。死結又回來了，只是這次卡在 k8s 看不到的地方。看完用 `kubectl -n pricer rollout undo deploy/model-server` 收回。
+3. **`nvidia.com/gpu: 3` 是謊報。** scheduler 以為有三張卡，對記憶體壓力毫無感知。**這正是 production 要用 MIG 的理由。** （選作，精簡路線讀就好）親眼看一次：2 個 replica 時再 `rollout restart`，第 3 個 pod 會**排程成功**（拿到第 3 個切片），然後在啟動時因為顯存不夠而 CrashLoop —— 不是 `Pending`。死結又回來了，只是這次卡在 k8s 看不到的地方。看完用 `kubectl -n pricer rollout undo deploy/model-server` 收回。
 4. **效能非線性。** 見上面那張表。
 
 ### 7.5 隔離強度光譜（面試必考）
@@ -496,7 +496,41 @@ time-slicing   →   MPS            →   MIG              →   整卡獨佔
 
 ### 8.1 做法
 
-GPU Operator 已經幫你裝好 DCGM exporter 了：
+GPU Operator 已經幫你裝好 DCGM exporter 了，**但 `SM_ACTIVE` 預設不會輸出**。
+
+GPU Operator 讓 exporter 讀 image 內建的 `/etc/dcgm-exporter/dcp-metrics-included.csv`，那份清單裡 `DCGM_FI_DEV_GPU_UTIL` 和 `DCGM_FI_PROF_PIPE_TENSOR_ACTIVE` 是開的，**`DCGM_FI_PROF_SM_ACTIVE` 被註解掉了**（2026-10 查 NVIDIA/gpu-operator main 的 `assets/state-dcgm-exporter/0800_daemonset.yaml` 與 NVIDIA/dcgm-exporter `4.8.4` 的 csv）。不處理的話 `grep SM_ACTIVE` 什麼都抓不到，也不會有任何錯誤。
+
+**先換一份自訂清單**：
+
+```bash
+# image 是 distroless 的，沒有 cat，不能 exec 進去拿 —— 從 GitHub 抓「同一版」的清單。
+# image tag 長這樣：4.6.1-4.8.4-distroless（<DCGM>-<exporter>-<變體>）。
+# GitHub 的 git tag 大多是 <DCGM>-<exporter>（例如 4.6.0-4.8.3），但也有只寫 exporter 版本的（例如 4.8.4），兩個都試。
+TAG=$(kubectl -n gpu-operator get ds nvidia-dcgm-exporter \
+  -o jsonpath='{.spec.template.spec.containers[0].image}' | sed -E 's/.*://; s/-(distroless|ubuntu.*)$//')
+echo "$TAG"                                   # 例如 4.6.1-4.8.4
+rm -f /tmp/dcgm-orig.csv
+for ref in "$TAG" "${TAG##*-}"; do
+  curl -fsSL "https://raw.githubusercontent.com/NVIDIA/dcgm-exporter/${ref}/etc/dcp-metrics-included.csv" \
+    -o /tmp/dcgm-orig.csv && { echo "用 $ref"; break; }
+done
+test -s /tmp/dcgm-orig.csv || echo "❌ 兩個 ref 都抓不到，去 https://github.com/NVIDIA/dcgm-exporter/tags 找對應的 tag"
+
+sed 's/^# *DCGM_FI_PROF_SM_ACTIVE/DCGM_FI_PROF_SM_ACTIVE/' /tmp/dcgm-orig.csv > /tmp/dcgm-metrics.csv
+grep -E "^DCGM_FI_(DEV_GPU_UTIL|PROF_SM_ACTIVE|PROF_PIPE_TENSOR_ACTIVE)" /tmp/dcgm-metrics.csv   # 三行都要在，少一行就別往下做
+
+# key 必須叫 dcgm-metrics.csv（GPU Operator 的規定）
+kubectl -n gpu-operator create configmap custom-dcgm-metrics --from-file=dcgm-metrics.csv=/tmp/dcgm-metrics.csv
+kubectl patch clusterpolicy/cluster-policy --type merge \
+  -p '{"spec":{"dcgmExporter":{"config":{"name":"custom-dcgm-metrics"}}}}'
+
+# 等 exporter 重建。operator 是非同步改 DaemonSet 的：先等 DaemonSet 真的引用了新 ConfigMap，
+# 否則 rollout status 可能回報的是「舊的那版已完成」
+timeout 300 bash -c 'until kubectl -n gpu-operator get ds nvidia-dcgm-exporter -o yaml | grep -q custom-dcgm-metrics; do sleep 5; done'
+kubectl -n gpu-operator rollout status ds/nvidia-dcgm-exporter
+```
+
+> DaemonSet 名稱依 GPU Operator 版本可能不同，對不上就 `kubectl -n gpu-operator get ds | grep dcgm` 看實際名字。L4 支不支援 profiling（`PROF_*`）指標要在機器上確認：下一步 `curl` 若連 `PIPE_TENSOR_ACTIVE` 都沒有，就是硬體或驅動不支援，記進 `KNOWN-GAPS.md`。
 
 ```bash
 kubectl -n gpu-operator get pods | grep dcgm
