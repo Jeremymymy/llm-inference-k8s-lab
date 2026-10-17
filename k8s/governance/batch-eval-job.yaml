@@ -18,7 +18,11 @@ metadata:
   name: batch-eval
   namespace: pricer
 spec:
-  # completions / parallelism：把 60 次評估切成 3 條平行做完。
+  # completions / parallelism：總共要成功 60 個 pod（分片），同時最多跑 3 個。
+  # 每個 pod 自己打 20 次請求，所以整個 Job 是 60 × 20 = 1200 次請求、約 20–40 分鐘 ——
+  # 刻意讓 batch 長時間佔著卡，Part 9 才有足夠的時間觀察搶佔。
+  # 跑完的 pod 會停在 Completed，直到 Job 結束後 ttlSecondsAfterFinished 才一起清掉，
+  # 所以 get pods 會看到一長串，這是正常的。
   # 這是 Job 相對於「自己寫迴圈」的價值 —— 分片與重試由 k8s 管。
   completions: 60
   parallelism: 3

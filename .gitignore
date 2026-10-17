@@ -22,3 +22,6 @@ __pycache__/
 
 # macOS
 .DS_Store
+
+# Claude Code（本機 session 資料、HANDOFF）
+.claude/

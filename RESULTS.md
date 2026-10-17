@@ -41,6 +41,23 @@
 
 ---
 
+## Phase 0.5（kind 三節點）實測訊息
+
+2026-10-16～17，kind v1.37.0（1 control-plane + 2 worker），OrbStack VM 12 GiB，精簡路線。以下都是實際終端輸出（節錄），不是推論。Part 6、8 使用者先做過，這裡的輸出是 2026-10-17 在同一個叢集上重跑取得的。
+
+| Part | 觀察到的 | 實際輸出 / 數字 | 跟 docs 預期的差異 |
+|---|---|---|---|
+| 2. RWO 跨節點 | 新 pod 卡 `Pending` | `0/3 nodes are available: 1 Insufficient memory, 1 node(s) didn't match PersistentVolume's node affinity, 1 node(s) had untolerated taint(s).` | worker 那行是 `Insufficient memory` 而非 anti-affinity（scheduler 每節點只報第一個失敗的檢查）；patch 同時改 replicas + template → 舊 RS 先擴到 2（同擠 worker）+ 新 RS 1 個 Pending，共 3 個 pod。docs 已補說明 |
+| 5. spread | 兩個 pricer-api 都在 worker2 | — | 5.1 的 `pricer.io/gpu` taint 還在，pricer-api 只剩 worker2 可去，`ScheduleAnyway` 擠一起。docs 已補說明 |
+| 6. drain + PDB | drain 卡住直到 timeout | `error when evicting pods/"model-server-…" -n "pricer" (will retry after 5s): Cannot evict pod as it would violate the pod's disruption budget.`（`ALLOWED DISRUPTIONS 0`，`--timeout=30s` 後 `global timeout reached`） | 符合 |
+| 7. ResourceQuota | `DESIRED 5 / CURRENT 3`，pod 建不出來 | `exceeded quota: pricer-quota, requested: limits.memory=7Gi,requests.cpu=2,requests.memory=5Gi, used: limits.memory=22016Mi,requests.cpu=6100m,requests.memory=15616Mi, limited: limits.memory=24Gi,requests.cpu=8,requests.memory=16Gi` | 符合；三項同時超過。used 含 2 個 Pending 的 model-server（Pending 也算配額） |
+| 8. 假 GPU | gpu-hog（要 4 張，剩 3 張）`Pending` | `0/3 nodes are available: 1 node(s) had untolerated taint(s), 2 Insufficient example.com/gpu.` | 符合 |
+| 9. 搶佔（第一次，舊順序） | 被踢的是**舊 model-server** 而非 batch | `pod/model-server-759d676bff-tttm5 Preempted by pod f3db53a0-… on node pricer-lab-worker`；3 個 batch pod 在 12 秒後 `exit 22` | 舊 pod 建立時沒有 priorityClassName（priority 0 < batch 100），被選為 victim；搶佔不走 rollout，造成停機。docs 9.1 已改順序並寫進 ⚠️ 陷阱 |
+| 9. 搶佔（第二次，新順序） | batch 被踢，補的 batch pod 不反搶 | `pod/batch-eval-9pdfc Preempted by pod 3a012699-…`；`preemption: not eligible due to preemptionPolicy=Never.` | 符合 |
+| 9/10. Job | 3 個平行、陸續 `Completed` | `COMPLETIONS 60 / PARALLEL 3`，觀察時 `SUCCEEDED 8 / ACTIVE 3 / FAILED 1`（FAILED 是被搶佔的那個） | 符合 |
+
+---
+
 ## 本機 HPA 壓測（Phase 0）
 
 Mac / OrbStack（VM 8 GiB）/ llama.cpp Q8_0 + LoRA，`--parallel 4`。`eval/measure.py --size 200 --workers 30`，打 model-server Service（docs/02 9.4）。**各跑一次，沒有熱身**：這裡驗證的是 HPA 機制，不是效能數字。

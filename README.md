@@ -89,8 +89,8 @@
 
 ## 進度
 
-- [ ] **Phase 0** — 本機 k8s 骨架與可觀測性（$0）
-- [ ] **Phase 0.5** — kind 三節點：排程、drain/PDB、資源治理（$0）
+- [x] **Phase 0** — 本機 k8s 骨架與可觀測性（$0）
+- [x] **Phase 0.5** — kind 三節點：排程、drain/PDB、資源治理（$0）
 - [ ] **Phase 1** — 雲端 GPU + vLLM 服務化與正確性驗證
 - [ ] **Phase 2** — 效能調校、壓測、量化對照
 - [ ] **Phase 3** — k3s + GPU + time-slicing + DCGM

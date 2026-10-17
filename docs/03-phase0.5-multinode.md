@@ -204,6 +204,8 @@ Warning  FailedAttachVolume  Multi-Attach error for volume "pvc-xxxx"
 ```
 
 > ⚠️ 上面 kind 那段是依 local-path 的機制推論的預期輸出，確切措辭依 k8s 版本而異。**以你實際看到的為準，貼進 `RESULTS.md`。**
+>
+> 實測（kind 三節點）worker 那行可能顯示 `1 Insufficient memory` 而不是 anti-affinity：scheduler 每個節點只報**第一個**沒通過的檢查，資源檢查排在 anti-affinity 前面，而 worker 已被兩個舊 pod 佔滿記憶體（原因見下面「順帶一提」）。兩條其實都違反，結論一樣是排不進去。
 
 **兩種都是同一個道理（RWO 綁節點），只是擋下來的時間點不同**：
 
@@ -215,7 +217,7 @@ Warning  FailedAttachVolume  Multi-Attach error for volume "pvc-xxxx"
 
 `kubectl get pv -o yaml | grep -A8 nodeAffinity` 可以親眼看到 local-path 的 PV 被綁在哪個節點。
 
-**順帶一提**：這個 patch 改了 pod template，會觸發 rollout。新 pod 除了要避開舊 pod（anti-affinity），又被 PV 綁回舊 pod 所在的節點 —— 兩個條件互相矛盾，rollout 會一直卡著，舊 pod 繼續跑。所以這一步實際上只會有**一個** llama-server 在跑。
+**順帶一提**：這個 patch 同時改了 replicas 和 pod template。Deployment controller 會**先處理擴容**，把舊 ReplicaSet（沒有 anti-affinity）從 1 擴到 2 —— 這個新增的舊範本 pod 不受 anti-affinity 限制，會跟原本那個一起擠在 worker 上跑起來。**接著**才因為 template 改了而開新 ReplicaSet 做 rollout（`maxSurge: 1`），新 pod 要避開舊 pod、又被 PV 綁回 worker，兩個條件互相矛盾，永遠 `Pending`；`maxUnavailable: 0` 又不准在新 pod Ready 前砍舊的，rollout 一直卡著。所以實際會看到**三個** pod：兩個舊的 `Running`（同一台 worker）＋ 一個新的 `Pending`，`kubectl -n pricer get rs -l app=model-server` 可以看到兩個 RS。想只看純 anti-affinity 效果，就把 patch 拆兩步：先加 affinity 等 rollout 完成，再把 replicas 改成 2。
 
 ### 2.3 為什麼 Phase 0 看不到這個
 
@@ -565,6 +567,8 @@ kubectl -n pricer patch deploy/pricer-api --type=json -p='[
 kubectl -n pricer get pods -l app=pricer-api -o wide
 ```
 
+> 如果 5.1 的 `pricer.io/gpu` taint 還在，兩個 pod 會**都擠在 worker2**，這是預期的。pricer-api 沒有 toleration，能排的節點只剩 worker2，`ScheduleAnyway` 沒得選就擠一起。patch 前之所以一台一個，是因為舊 pod 在上 taint 之前就排好了（`NoSchedule` 不趕已經在跑的 pod），而這個 patch 觸發 rollout 重新排程。想看到真的分散：先 `kubectl taint node pricer-lab-worker pricer.io/gpu:NoSchedule-` 再 `rollout restart`，做完記得把 taint 加回去。
+
 **`whenUnsatisfiable` 的取捨**：
 
 | 值 | 排不下時 | 適用 |
@@ -824,32 +828,44 @@ kubectl get priorityclass
 
 **為什麼要先拿掉配額**：配額擋在 admission，搶佔發生在 scheduling（Part 8 那張表）。`pricer` 的配額只允許 2 張 GPU —— batch 佔滿配額之後，model-server 的新 pod **連建立都建立不了**，scheduler 根本看不到它，也就不會為它搶佔。**搶佔救不了配額。** 這在真實平台上是很常見的誤會：「我設了高優先級，為什麼還是起不來？」—— 先看是不是卡在 quota。
 
-先讓低優先的 batch job 把卡佔滿：
+**第一步：趁卡還有空位，先把 model-server 換成高優先級**（順序很重要，理由見下面 ⚠️ 陷阱第一條）：
 
 ```bash
+# 改 pod template 會觸發 rollout（maxSurge: 1）。這時 4 張卡只用了 1 張，
+# 新 pod 直接拿空的卡，不會搶佔任何人
+kubectl -n pricer patch deploy/model-server --type=json -p='[
+  {"op":"add","path":"/spec/template/spec/priorityClassName","value":"inference-critical"}
+]'
+kubectl -n pricer rollout status deploy/model-server
+kubectl -n pricer get pods -l app=model-server -o custom-columns=NAME:.metadata.name,PRIO:.spec.priority
+# PRIO 要是 1000000 才往下走
+```
+
+**第二步：讓低優先的 batch job 把剩下的卡佔滿**：
+
+```bash
+kubectl -n pricer delete job batch-eval --ignore-not-found   # 之前跑過的話先清掉
 kubectl apply -f k8s/governance/batch-eval-job.yaml
 kubectl -n pricer get pods -l job-name=batch-eval -o wide
 # 3 個 batch pod Running（parallelism: 3，各佔 1 張）+ model-server 的 1 張 = 4 張全滿
 kubectl describe node pricer-lab-worker | grep -A8 "Allocated resources" | grep example.com/gpu
 ```
 
-再讓高優先的推論服務進來要卡：
+**第三步：讓高優先的推論服務再進來要一張卡**：
 
 ```bash
-# 只改優先級、不加 replica。改 pod template 會觸發 rollout（maxSurge: 1），
-# 新 pod 要 1 張卡，但 4 張全滿 → scheduler 踢掉一個 batch pod
-kubectl -n pricer patch deploy/model-server --type=json -p='[
-  {"op":"add","path":"/spec/template/spec/priorityClassName","value":"inference-critical"}
-]'
+# rollout restart 開一個新的 model-server pod（maxSurge: 1），
+# 它要 1 張卡，但 4 張全滿 → 候選 victim 只剩比它低的 batch（100）→ 踢掉一個 batch pod
+kubectl -n pricer rollout restart deploy/model-server
 
 # 看搶佔發生
 kubectl -n pricer get events --sort-by=.lastTimestamp | grep -i preempt
 kubectl -n pricer get pods -l job-name=batch-eval -w
 ```
 
-**為什麼不順便把 replicas 調到 3**：每個 replica 都是一個 4.5 GiB 的 llama-server，rollout 期間新舊並存已經是兩個，再加就超過 12 GiB 的 VM 了。一個新 pod 就足以觸發搶佔。
+**為什麼用 restart 而不是把 replicas 調到 2**：每個 replica 都是一個 4.5 GiB 的 llama-server，rollout 期間新舊並存已經是兩個，再加就超過 12 GiB 的 VM 了。一個新 pod 就足以觸發搶佔。
 
-**接著觀察被踢掉之後發生什麼**：Job 會補一個新的 batch pod，但它卡在 `Pending` —— 優先級低、而且 `preemptionPolicy: Never`，不會反過來搶。等舊的 model-server pod 關掉、釋出那張卡，它才排進去。**這就是「有空位就做，沒空位就等」的實際樣子。**
+**接著觀察被踢掉之後發生什麼**：Job 會補一個新的 batch pod，但它卡在 `Pending` —— 優先級低、而且 `preemptionPolicy: Never`，不會反過來搶。等舊的 model-server pod 關掉、釋出那張卡，它才排進去。**這就是「有空位就做，沒空位就等」的實際樣子。** 整個過程舊 model-server 一直在服務，batch 打 pricer-api 也不會失敗。
 
 你會看到類似：
 ```
@@ -883,6 +899,7 @@ preemptionPolicy: Never          # ← 這行很重要
 
 ### ⚠️ 陷阱
 
+- **用 rollout 引入 PriorityClass 時，舊 pod 的優先級是 0，會最先被踢。** 優先級在 pod 建立時就定死，改 Deployment 不會回頭改已存在的 pod。如果先讓 batch（100）佔滿卡、再 patch `priorityClassName`，新 pod 找 victim 時會挑**最低**的 —— 舊 model-server（0），而不是 batch。事件會是 `pod/model-server-xxx Preempted by pod <新 pod 的 UID>`，舊 RS 補的 pod（也是 0）搶不到任何人卡 `Pending`。更糟的是**搶佔不走 rollout 流程**，`maxUnavailable: 0` 擋不住：新 pod 冷啟動期間沒有任何 model-server 在服務，batch 打 pricer-api 會失敗（curl `exit 22`）。實務上要先把線上服務換成高優先級，再讓低優先工作進場。
 - **搶佔是「刪除」不是「暫停」。** 被踢掉的 pod 是被殺掉、從頭重來。所以低優先的工作必須是可重跑的，而且最好有 checkpoint。
 - **`globalDefault: true` 只能有一個 PriorityClass。** 設了之後所有沒指定優先級的 pod 都會拿到它，影響範圍很大，這個 lab 兩個都設 `false`。
 - **PDB 會擋搶佔嗎？** 排程器會**盡量**尊重 PDB，但在找不到其他方案時仍會違反它。PDB 對搶佔是「盡力而為」，不是硬保證。
@@ -989,16 +1006,16 @@ spec:
 
 ## Phase 0.5 驗收清單
 
-- [ ] 三節點叢集跑起來，`kubectl get nodes` 看到 3 個 Ready
-- [ ] **親眼看到 RWO 讓另一個節點的 pod 起不來**，並記下實際的錯誤訊息（kind 上預期是 `volume node affinity conflict`；這是本 Phase 最重要的一項）
+- [x] 三節點叢集跑起來，`kubectl get nodes` 看到 3 個 Ready
+- [x] **親眼看到 RWO 讓另一個節點的 pod 起不來**，並記下實際的錯誤訊息（kind 上預期是 `volume node affinity conflict`；這是本 Phase 最重要的一項）
 - [ ] （選作，精簡路線跳過）RWX 的 PVC 讓兩個 replica 分散在不同節點上都掛載成功
 - [ ] （選作，精簡路線跳過）MetalLB 給 LoadBalancer 發出真實 IP，且 `curl` 得通
-- [ ] taint 造成 `FailedScheduling`，加上 toleration + nodeSelector 後恢復
-- [ ] `drain` 被 PDB 擋住（單 replica + minAvailable: 1）
-- [ ] 超出 ResourceQuota 時 pod 被拒絕，events 裡看得到 `exceeded quota`
-- [ ] 假的 `example.com/gpu` 讓 pod 在超額時 `FailedScheduling`，並對照過 `exceeded quota` 的差別
-- [ ] **`kubectl get events` 看到 `Preempted`**
-- [ ] batch Job 確實以 `parallelism: 3` 平行分片執行、陸續有 pod `Completed`（Part 9 跑的那個 Job 就算；在 CPU 上整個 Job 可能跑不完 60 個分片就撞到 `activeDeadlineSeconds`，不要求跑完）
+- [x] taint 造成 `FailedScheduling`，加上 toleration + nodeSelector 後恢復
+- [x] `drain` 被 PDB 擋住（單 replica + minAvailable: 1）
+- [x] 超出 ResourceQuota 時 pod 被拒絕，events 裡看得到 `exceeded quota`
+- [x] 假的 `example.com/gpu` 讓 pod 在超額時 `FailedScheduling`，並對照過 `exceeded quota` 的差別
+- [x] **`kubectl get events` 看到 `Preempted`**
+- [x] batch Job 確實以 `parallelism: 3` 平行分片執行、陸續有 pod `Completed`（Part 9 跑的那個 Job 就算；在 CPU 上整個 Job 可能跑不完 60 個分片就撞到 `activeDeadlineSeconds`，不要求跑完）
 - [ ] （選作，精簡路線跳過）已確認並記錄 kind 的 CNI 是否執行 NetworkPolicy
 
 ---
