@@ -107,30 +107,16 @@ NAT Gateway 是 $0.045/hr + 流量費，**忘記刪就是每月約 $32**。
 
 ## 一鍵健檢
 
-把這個存成 `scripts/aws-check.sh`：
+腳本在 [`scripts/aws-check.sh`](../scripts/aws-check.sh)：
 
 ```bash
-#!/usr/bin/env bash
-R=${1:-us-east-1}
-echo "=== 執行中的機器 ==="
-aws ec2 describe-instances --region "$R" \
-  --filters "Name=instance-state-name,Values=running,pending" \
-  --query 'Reservations[].Instances[].[InstanceId,InstanceType,State.Name]' --output table
-echo "=== 閒置的 EBS ==="
-aws ec2 describe-volumes --region "$R" --filters "Name=status,Values=available" \
-  --query 'Volumes[].[VolumeId,Size]' --output table
-echo "=== 未綁定的 EIP ==="
-aws ec2 describe-addresses --region "$R" \
-  --query 'Addresses[?AssociationId==null].[PublicIp]' --output table
-echo "=== NAT Gateway ==="
-aws ec2 describe-nat-gateways --region "$R" --filter "Name=state,Values=available" \
-  --query 'NatGateways[].[NatGatewayId]' --output table
-echo "=== Load Balancer ==="
-aws elbv2 describe-load-balancers --region "$R" \
-  --query 'LoadBalancers[].[LoadBalancerName,Type]' --output table
+scripts/aws-check.sh              # 預設 us-east-1
+scripts/aws-check.sh us-west-2    # 其他 region
 ```
 
-**五個區塊全空 = 你今天不會被收錢。**
+檢查上面的五項（執行中的機器、閒置 EBS、未綁定 EIP、NAT Gateway、Load Balancer）。有資源時每一筆底下會印出對應的清理指令（只印、不執行）。
+
+**五個區塊全是「（無）」= 你今天不會被收錢。** 結束碼：`0` 全空、`2` 有資源、`1` 憑證或查詢失敗。
 
 ---
 
