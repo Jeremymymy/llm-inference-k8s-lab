@@ -204,12 +204,12 @@ vLLM 讓你用這幾個旋鈕控制這條曲線：
 
 ### 5.3 量化什麼時候「不會」加速
 
-這是最常見的誤解。量化省的是**記憶體頻寬**，所以：
+這是最常見的誤解。**只壓權重**的量化（weight-only，運算前解回 bf16）省的是**記憶體頻寬**，所以：
 
 - **decode 主導**（長輸出、chat）→ memory-bound → 量化有明顯加速
-- **prefill 主導**（本 lab，輸出只有 5 token）→ compute-bound → **量化對速度的幫助很小**，主要好處只剩省記憶體
+- **prefill 主導**（本 lab，輸出只有 5 token）→ compute-bound → **weight-only 量化對速度的幫助很小**，主要好處只剩省記憶體
 
-［Phase 2 會實測這件事。如果你量出來「量化後沒變快」，那不是你做錯了，那就是正確答案。］
+**例外是連激活一起量化的 W8A8**（例如 Ada / Hopper 上的 FP8）：運算本身也用 FP8 tensor core，算力約是 bf16 的兩倍，compute-bound 也會變快。Phase 2 實測：L4 上 vLLM 的 online FP8 走 CUTLASS W8A8 kernel，merged 模型飽和吞吐 53.4 → 73.3 req/s（+37%），MAE 沒有退化。要先看 log 確認選到哪個 kernel，再推論會不會加速。
 
 ### 5.4 LoRA：為什麼能熱插拔
 

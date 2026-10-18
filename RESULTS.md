@@ -14,7 +14,7 @@
 | 固定猜平均值 | $106.18 |
 | 人類（課程作者） | $87.62 |
 | XGBoost | $68.23 |
-| 未微調的 Llama 3.2（4-bit） | **$110.72** ← 「LoRA 沒生效」的指紋 |
+| 未微調的 Llama 3.2（4-bit） | $110.72（課程 evaluator；本 repo 的 `eval/measure.py` 實測 base = **$200.29**，見正確性 #5，兩者不可直接比） |
 | 深度神經網路 | $46.49 |
 | GPT-5.1 | $44.74 |
 | **微調後（要復現的目標）** | **$39.85** |
@@ -28,16 +28,16 @@
 | # | 日期 | 環境 | 權重精度 | LoRA 方式 | MAE | R² | Hit rate | 備註 |
 |---|---|---|---|---|---|---|---|---|
 | 1 | 2026-09-25 | Mac / llama.cpp | Q8_0 | GGUF f16 runtime | $40.79 | 72.1% | 75.0% | Phase 0；4 次 MAE 完全相同 |
-| 2 | | GPU / vLLM | bf16 | runtime, rank 256 | | | | Phase 1 主線 |
+| 2 | 2026-10-18 | GPU / vLLM | bf16 | runtime, rank 256 | $40.74 | 71.9% | 75.0% | Phase 1 主線；`--max-loras 2`（多掛 `pricer2`） |
 | 3 | — | GPU / vLLM | bf16 | runtime, **預設 rank 16** | 起不來 | — | — | 大聲失敗；精簡路線未實跑，依 vLLM 原始碼推論 |
-| 4 | | GPU / vLLM | bf16 | merged | | | | 應與 #2 一致 |
-| 5 | | GPU / vLLM | bf16 | 無（base） | | | | 應接近 $110 |
-| 6 | | GPU / vLLM | **FP8** | merged | | | | 量化代價（跟 #4 比） |
+| 4 | 2026-10-18 | GPU / vLLM | bf16 | merged | $40.80 | 72.0% | 74.0% | 與 #2 一致 ✅ |
+| 5 | 2026-10-18 | GPU / vLLM | bf16 | 無（base） | $200.29 | -695.9% | 48.5% | **不是** leaderboard 的 $110；解析正確，base 常猜 `1,999.99` 這類價格，誤差最大 8 筆占總誤差 30% |
+| 6 | 2026-10-18 | GPU / vLLM | **FP8** | merged | $40.15 | 73.4% | 75.5% | 量化代價（跟 #4 比） |
 | 7 | | k3s / vLLM | bf16 | runtime, rank 256 | | | | **應與 #2 完全一致** |
 
-**#2 vs #5 的差距** = 請求打到 base（無聲失敗）的代價：___
-**#2 vs #1 的差距** = Q8_0 量化的代價：___
-**#4 vs #6 的差距** = FP8 量化的代價（兩者都是 merged，只差量化）：___
+**#2 vs #5 的差距** = 請求打到 base（無聲失敗）的代價：$159.55（MAE 變成約 5 倍）—— 在這套評估裡，「LoRA 沒生效」的指紋是 **約 $200**
+**#2 vs #1 的差距** = Q8_0 量化的代價：−$0.05（0.1%，單次量測不下結論）—— Q8_0 對這個任務幾乎無損
+**#4 vs #6 的差距** = FP8 量化的代價（兩者都是 merged，只差量化）：−$0.65（FP8 反而略好 1.6%，<5% 不下結論）—— 沒有可量到的代價
 
 ---
 
@@ -71,59 +71,93 @@ Mac / OrbStack（VM 8 GiB）/ llama.cpp Q8_0 + LoRA，`--parallel 4`。`eval/mea
 
 ## 效能
 
-g6.xlarge / NVIDIA L4 24GB。工具：`vllm bench serve`，`--random-input-len 150 --random-output-len 5`。
+2026-10-18，g6.xlarge / NVIDIA L4（23034 MiB，compute 8.9）。**vLLM 0.31.0**（`vllm/vllm-openai@sha256:c1c9f6fd5c109ba7f0546a59f5b2f15fb87f64c77782e90a27b648b42a8e67c3`），`--gpu-memory-utilization 0.85`。工具：`vllm bench serve`，`--random-input-len 150 --random-output-len 5`，飽和 = `--num-prompts 500 --request-rate inf`。**每次壓測都用沒用過的 `--seed`**（理由見下一節）。全部是單次量測。
 
-### `--max-model-len` 的影響（預期：131072 起不來，其餘兩組吞吐差不多 —— KV cache 按需分配）
+### ⚠️ 量測陷阱：prefix caching 讓同一批 prompt 快 7 倍
+
+vLLM V1 預設開 prefix caching，`vllm bench serve` 的 random dataset 預設 `seed=0` —— 不指定 seed 的話，每次產生的 prompt 都一樣，第二次之後 prefill 幾乎全部命中快取。
+
+| 同一個 seed=42 連跑兩次 | 新增 prefix cache 查詢 | 新增命中 | 命中率 | 飽和吞吐 (req/s) | p99 TTFT |
+|---|---|---|---|---|---|
+| 第 1 次 | 75,000 | 720 | 1% | 35.89 | 13,666 ms |
+| 第 2 次 | 75,000 | 72,000 | 96% | 258.34 | 1,633 ms |
+
+一開始照 runbook（沒指定 seed）量到的「253 req/s」、以及 300 筆固定 rate 掃描「到 280 req/s 都沒有轉折」，全部是這個假象，已作廢重量。計數器：`curl -s localhost:8000/metrics | grep -E "^vllm:prefix_cache_(queries|hits)_total"`。
+
+### `--max-model-len` 的影響（預期：131072 起不來，其餘兩組吞吐差不多 —— KV cache 按需分配）✅ 符合
 
 | `--max-model-len` | KV cache size (tokens) | Maximum concurrency | 飽和吞吐 (req/s) | p50 TTFT | p95 TTFT | p99 TTFT |
 |---|---|---|---|---|---|---|
-| 131072（預設） | 起不來？ | | | | | |
-| 32768 | | | | | | |
-| 512 | | | | | | |
+| 131072（預設） | 起不來：`ValueError: ... (14.0 GiB KV cache is needed, which is larger than the available KV cache memory (9.07 GiB). Based on the available memory, the estimated maximum model length is 84864.` | — | — | — | — | — |
+| 32768 | 84,880 | 2.59x | 35.92 | 7,230 ms | 13,282 ms | 13,644 ms |
+| 512 | 84,864 | 165.75x | 35.77 | 7,236 ms | 13,341 ms | 13,708 ms |
+
+estimated maximum model length（84,864）= 512 那組的 KV cache size：KV 總量跟 `--max-model-len` 無關，它只決定啟動檢查與 `Maximum concurrency` 的分母。
 
 ### `--max-num-batched-tokens` 的影響（其餘同 512 那組）
 
-| `--max-num-batched-tokens` | 飽和吞吐 (req/s) | 固定 rate ___ req/s 下的 p99 TTFT | 備註 |
-|---|---|---|---|
-| 預設（log 讀到：___；預期 2048） | | | |
-| 8192 | | | |
+| `--max-num-batched-tokens` | 飽和吞吐 (req/s) | 飽和 p50 TPOT | 固定 rate 30 req/s 下的 p99 TTFT | 備註 |
+|---|---|---|---|---|
+| 預設（log 不印；讀 0.31 `vllm/engine/arg_utils.py`：<70 GiB 的 GPU、API server = **2048**） | 35.77 | 356 ms | 495 ms | log 只有 `chunked_prefill=True` |
+| 8192 | 35.90 | **994 ms** | 530 ms（+7%，單次） | KV cache 84,608（少 256） |
+
+**結論**：吞吐不變 → 瓶頸不在批次大小（compute-bound）。代價是 decode 被更大的 prefill 批次卡住，TPOT 變 2.8 倍；這個 workload 只輸出 5 token 所以看不太出來，長輸出會很明顯。
 
 ### request-rate 掃描（找 SLA 轉折點）
 
-| req/s | p50 TTFT | p95 TTFT | **p99 TTFT** | 佇列長度 |
-|---|---|---|---|---|
-| 5 | | | | |
-| 10 | | | | |
-| 20 | | | | |
-| 40 | | | | |
-| 80 | | | | |
-| 160 | | | | |
+runtime LoRA（512 那組）。每個 rate 跑約 15 秒（`--num-prompts = rate × 15`），seed = 1000 + rate。
 
-**p99 開始急遽上翹的點**：___ req/s → 這是實際容量上限，也是 HPA 門檻的依據。
+| req/s（設定） | 實際 req/s | p50 TTFT | p95 TTFT | **p99 TTFT** |
+|---|---|---|---|---|
+| 10 | 9.85 | 118 ms | 180 ms | 196 ms |
+| 20 | 19.63 | 158 ms | 246 ms | 331 ms |
+| 25 | 24.49 | 201 ms | 323 ms | 366 ms |
+| 30 | 29.32 | 267 ms | 440 ms | 495 ms |
+| 35 | 34.03 | 505 ms | 828 ms | 910 ms |
+| 40 | 35.71 | 1,345 ms | 1,866 ms | 1,956 ms |
+| 50 | 36.42 | 2,652 ms | 5,230 ms | 5,555 ms |
+
+**p99 開始急遽上翹的點**：約 **30 req/s**（飽和吞吐的 84%）→ 這是實際容量上限，也是 HPA 門檻的依據。超過約 36 req/s 實際吞吐就上不去，佇列隨時間線性變長。
+
+固定 300 筆的掃描在高 rate 只跑 1–2 秒，佇列來不及排起來，量不到轉折 —— 所以改成固定時長。
+
+### 瓶頸判讀（docs/05 Part 7，512 那組飽和時的尖峰）
+
+| GPU `sm`（`nvidia-smi dmon`） | `kv_cache_usage_perc` | `num_requests_waiting` | CPU（全機 us / vLLM 程序） | 診斷 |
+|---|---|---|---|---|
+| 100% | 0.128 | 430 | 28% / 109% | **compute-bound**（符合 docs/05 7.3 預測） |
 
 ### 量化對照（品質 vs 吞吐）
 
-| 量化 | 顯存佔用 | MAE | 飽和吞吐 | p95 TTFT |
-|---|---|---|---|---|
-| bf16 | | | | |
-| FP8 | | | | |
-| AWQ（選作） | | | | |
+都是 merged、`--max-model-len 512`。
+
+| 量化 | 權重（`Model loading took`） | KV cache size | MAE | 飽和吞吐 | p95 TTFT | p50 TPOT |
+|---|---|---|---|---|---|---|
+| bf16 | 6.04 GiB | 106,400 | $40.80 | 53.38 | 8,966 ms | 238 ms |
+| FP8（`--quantization fp8`） | 3.57 GiB | 127,520 | $40.15 | **73.28（+37%）** | 6,512 ms | 169 ms |
+| AWQ（選作） | 未做 | | | | | |
+
+FP8 在 L4 上選到 `CutlassFP8ScaledMMLinearKernel`（真 W8A8，不是只存 FP8 權重），量化了 112 層（28 層 × qkv/o/gate_up/down）。所以 compute-bound 的 prefill 也變快 —— 跟 docs/05 5.3 原本「量化不一定變快」的預測相反。0.31 會警告 `--quantization fp8 is deprecated ... use --quantization fp8_per_tensor`。
 
 ### runtime LoRA vs merged（原創實驗，r=256）
 
 > runtime 那列是用 `--max-loras 2`（多掛 `pricer2`）量的，比 merged 多一個變因（docs/04 Part 6.3）。
 
-| 方式 | MAE | 飽和吞吐 | p95 TTFT | 可熱插拔 |
-|---|---|---|---|---|
-| runtime LoRA | | | | ✅ |
-| merged | | | | ❌ |
+| 方式 | MAE | 權重（`Model loading took`） | KV cache size | 飽和吞吐 | p95 TTFT | 可熱插拔 |
+|---|---|---|---|---|---|---|
+| runtime LoRA | $40.74 | 7.76 GiB | 84,864 | 35.77 | 13,341 ms | ✅ |
+| merged | $40.80 | 6.04 GiB | 106,400 | **53.38（+49%）** | 8,966 ms | ❌ |
+
+LoRA 預留約 1.7 GiB 顯存（rank 256 × 2 個 slot），KV 少 20%；吞吐差距大到不是 5% 雜訊，但有一部分可能來自 `--max-loras 2`。merge 本身（CPU、在 vLLM image 裡）花 1 分 48 秒，產出 6.0 GB 的 `model.safetensors`。
 
 ### 多 LoRA 同時服務
 
+`/v1/models` 列出 `['base', 'pricer', 'pricer2']`，`pricer` 與 `pricer2` 同一個 prompt 都回 `'99.00'`。1 vs 2 個 adapter 的效能差異精簡路線跳過。
+
 | 情境 | 吞吐 | p95 TTFT |
 |---|---|---|
-| 1 個 adapter | | |
-| 2 個 adapter（流量各半） | | |
+| 1 個 adapter | 未做 | |
+| 2 個 adapter（流量各半） | 未做 | |
 
 ---
 
@@ -159,8 +193,8 @@ g6.xlarge / NVIDIA L4 24GB。工具：`vllm bench serve`，`--random-input-len 1
 | 項目 | 數值 | 用在哪 |
 |---|---|---|
 | llama.cpp 冷啟動（Mac，CPU） | 約 70 秒（權重已在 PVC；2026-09-27 rollout 實測，建立→ready） | Phase 0 的 `startupProbe` |
-| vLLM 冷啟動（含權重下載） | | |
-| vLLM 冷啟動（權重已快取） | | **Phase 3 的 `startupProbe` 與 HPA 穩定視窗** |
+| vLLM 冷啟動（含權重下載） | 249 秒（runtime LoRA；image 已先 pull，`~/vllm-cache` 是空的；`Model loading took` 61 秒） | |
+| vLLM 冷啟動（權重已快取） | 121 秒（runtime LoRA 與 merged bf16 都是；`Model loading` 6–35 秒，其餘是編譯與 CUDA graph capture） | **Phase 3 的 `startupProbe` 與 HPA 穩定視窗** |
 | 單卡滾動更新的停機時間 | | 「該不該多買一張卡」的決策依據 |
 
 ---

@@ -61,7 +61,7 @@ curl -fL --progress-bar \
   "https://huggingface.co/QuantFactory/Llama-3.2-3B-GGUF/resolve/main/Llama-3.2-3B.Q8_0.gguf"
 ```
 
-**第二步：抓 LoRA adapter**（約幾百 MB，gated repo，需要憑證）
+**第二步：抓 LoRA adapter**（r=256，safetensors 約 1.5GB，gated repo，需要憑證）
 
 ```bash
 uv run --with huggingface_hub python3 - <<'PY'
@@ -160,7 +160,7 @@ curl -s http://localhost:8080/v1/completions \
 
 ### ⚠️ 陷阱
 
-- **MAE 約 $110 = LoRA 沒生效。** 這個數字不是巧合，它就是 leaderboard 上「未微調的 Llama 3.2」的分數。檢查 `--lora` 路徑對不對、llama-server 啟動 log 有沒有印出載入 adapter 的訊息。
+- **MAE 遠高於 $40（$110～$200 這一帶）= LoRA 沒生效。** leaderboard 上「未微調的 Llama 3.2」是 $110.72（課程 evaluator）；用本 repo 的 `eval/measure.py` 量 base，Phase 1 在 vLLM bf16 上實測是 $200.29（llama.cpp 上沒量過）。檢查 `--lora` 路徑對不對、llama-server 啟動 log 有沒有印出載入 adapter 的訊息。
 - **這個 adapter 是用 QLoRA（4-bit NF4 base）訓練的**，你現在把它套在 Q8_0 的 base 上。兩者的量化方式不同，**預期會有一些漂移**。這不是 bug，是要被記錄的變因 —— Phase 1 用 bf16 跑一次就能量出漂移有多大。
 - **轉檔時如果 lazy evaluation 出錯**，加 `--no-lazy`（會多吃記憶體但比較穩）。
 - **`llama-server` 啟動後第一個請求特別慢**，那是 warmup。量測時第一次的結果丟掉。
@@ -1024,7 +1024,7 @@ kubectl -n pricer logs -l app=model-server -c fetch-base-model
 
 **要理解的重點**：
 - initContainer 的 log **不會**出現在 `kubectl logs <pod>` 的預設輸出，一定要加 `-c <initContainer名>`。不知道這件事的話會查很久。
-- 我們的 initContainer 是**刻意設計成找不到 adapter 就失敗**的。如果它靜靜地跳過，服務會正常起來、正常回答、但 MAE 是 $110 而不是 $40。**開不起來的錯誤比安靜答錯的錯誤好一百倍**，這是一個真實的設計決策。
+- 我們的 initContainer 是**刻意設計成找不到 adapter 就失敗**的。如果它靜靜地跳過，服務會正常起來、正常回答、但 MAE 是 base 的 $200 左右而不是 $40。**開不起來的錯誤比安靜答錯的錯誤好一百倍**，這是一個真實的設計決策。
 
 **還原**：
 ```bash

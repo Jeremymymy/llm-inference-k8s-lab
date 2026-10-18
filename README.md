@@ -62,20 +62,23 @@
 | 設定 | MAE | 備註 |
 |---|---|---|
 | 課程 leaderboard 基準 | **$39.85** | 驗收門檻 |
-| 未微調的 base model | $110.72 | 「LoRA 沒生效」的指紋 |
-| llama.cpp Q8_0 + LoRA（Mac） | — | Phase 0 |
-| vLLM bf16 + LoRA rank 256 | — | Phase 1 主線 |
-| vLLM bf16 + **預設 rank 16** | — | 刻意重現的大聲失敗（啟動即拒絕） |
-| vLLM bf16 + merged 權重 | — | 應與主線一致 |
+| 未微調的 base model（leaderboard） | $110.72 | 課程 evaluator，跟下面不可直接比 |
+| 未微調的 base model（本 repo eval，vLLM bf16） | $200.29 | 「LoRA 沒生效」的指紋 |
+| llama.cpp Q8_0 + LoRA（Mac） | $40.79 | Phase 0 |
+| vLLM bf16 + LoRA rank 256 | $40.74 | Phase 1 主線 |
+| vLLM bf16 + **預設 rank 16** | — | 刻意重現的大聲失敗（啟動即拒絕；精簡路線未實跑） |
+| vLLM bf16 + merged 權重 | $40.80 | 與主線一致 |
+| vLLM FP8 + merged 權重 | $40.15 | 沒有可量到的量化代價 |
 
-### 效能（g6.xlarge / L4 24GB）
+### 效能（g6.xlarge / L4 24GB，vLLM 0.31.0，飽和、單次量測）
 
 | 設定 | 吞吐 | p95 TTFT | KV cache size |
 |---|---|---|---|
 | `--max-model-len 131072`（預設） | 起不來 | — | — |
-| `--max-model-len 32768` | — | — | — |
-| `--max-model-len 512` | — | — | — |
-| FP8 量化 | — | — | — |
+| `--max-model-len 32768`（runtime LoRA） | 35.92 req/s | 13,282 ms | 84,880 |
+| `--max-model-len 512`（runtime LoRA） | 35.77 req/s | 13,341 ms | 84,864 |
+| merged bf16 | 53.38 req/s | 8,966 ms | 106,400 |
+| FP8 量化（merged） | 73.28 req/s | 6,512 ms | 127,520 |
 | time-slicing 2 replica | — | — | — |
 
 ### 成本
@@ -91,8 +94,8 @@
 
 - [x] **Phase 0** — 本機 k8s 骨架與可觀測性（$0）
 - [x] **Phase 0.5** — kind 三節點：排程、drain/PDB、資源治理（$0）
-- [ ] **Phase 1** — 雲端 GPU + vLLM 服務化與正確性驗證
-- [ ] **Phase 2** — 效能調校、壓測、量化對照
+- [x] **Phase 1** — 雲端 GPU + vLLM 服務化與正確性驗證（精簡路線，2026-10-18）
+- [x] **Phase 2** — 效能調校、壓測、量化對照（精簡路線，2026-10-18）
 - [ ] **Phase 3** — k3s + GPU + time-slicing + DCGM
 - [ ] **Phase 4** — EKS 雲端↔地端對照（選作）
 

@@ -26,7 +26,7 @@
 
 | 症狀 | 最可能的原因 | 確認方式 | 修法 |
 |---|---|---|---|
-| **MAE 約 $110** | LoRA 完全沒生效 —— 請求打到 base 了 | 打 `--model base` 比對，如果兩者一樣就確定了 | 檢查請求的 `model` 欄位（pricer-api 的 `MODEL_NAME`）是不是 adapter 名稱 |
+| **MAE 遠高於 $40（本 eval 的 base 實測 $200）** | LoRA 完全沒生效 —— 請求打到 base 了 | 打 `--model base` 比對，如果兩者一樣就確定了 | 檢查請求的 `model` 欄位（pricer-api 的 `MODEL_NAME`）是不是 adapter 名稱 |
 | **MAE 略差但不離譜** | 量化漂移 | 換 bf16 跑一次對照 | 這是預期行為，記錄下來不是修 |
 | 回傳的價格總是 0 | prompt 模板不對，或 parse 失敗 | 看 `raw` 欄位的原始文字 | `Price is $` 的 `$` 後面**不能有空白** |
 | `IndexError` | 照抄了 Modal 版的 `split("Price is $")[1]` | — | vLLM / llama.cpp 只回續寫部分，不含 prompt。直接對回傳做 regex |

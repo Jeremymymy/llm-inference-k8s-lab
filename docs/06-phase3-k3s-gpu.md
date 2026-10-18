@@ -450,6 +450,16 @@ L4 顯存（nvidia-smi 顯示）        ≈ 22.5 GiB
 3 pod × 0.28 → 每個 6.3 GiB，連固定開銷都放不下                      ✗
 ```
 
+> ⚠️ **用 Phase 1/2 實測數字重算（2026-10-18，推算、未實測）**：上面的「1–2 GiB」可能太樂觀。Phase 1 ①（`--max-loras 2`）的 `Model loading took` 是 7.76 GiB，merged 是 6.04 GiB → 每個 r=256 LoRA 槽位約 0.86 GiB；本 overlay 只掛 1 個 adapter（預設 `--max-loras 1`），權重 + 槽位 ≈ 6.9 GiB。① 在 0.85 下的非 KV 開銷（activation、CUDA graph、CUDA context）≈ 19.1 − 7.76 − 9.07 ≈ 2.3 GiB。
+>
+> ```
+> 2 pod × 0.42 → 9.45 − 6.9 − 2.3 ≈ 0.25 GiB 給 KV cache（約 2,000 token）
+> ```
+>
+> 仍大於 `--max-model-len 512` 的啟動門檻，所以**應該起得來，但很緊**：並發上限變低，任何多一點的開銷（例如改成 `--max-loras 2`）就可能放不下。實跑時記下兩個 pod 各自的 `KV cache size`，填回這裡。
+
+> ⚠️ **單 pod 容量參考**（Phase 2，2026-10-18，docker 單獨跑、runtime LoRA、0.85）：飽和約 36 req/s，p99 TTFT 轉折點約 30 req/s。time-sliced 的兩個 pod 共用同一張卡的算力（compute-bound），**總和**預期不會超過這個數。
+
 **真正限制 replica 數的是「每個 pod 都要一份權重」，不是 KV cache。** KV cache 是按需分配的，150 token 的請求佔得很少，留一兩 GiB 就能跑很高的並發（見 Phase 2 Part 3）。
 
 這也是量化在本 workload 的真正價值：FP8 把每份權重砍到約 3.6 GB，3 個 pod 才有可能（選作：把 overlay 換成 Phase 2 的 FP8 merged 權重）。
@@ -655,6 +665,10 @@ kubectl -n pricer delete pod bench
 `--tokenizer` 為什麼必須寫，見 Phase 2 Part 2.1。
 
 **用 Phase 2 的曲線回頭校正 HPA 門檻**：你在 Phase 2 找到「排隊長度到多少時 p95 開始爆掉」，那就是 `averageValue` 該設的數字。**這是把量測轉成設定的完整閉環。**
+
+> ⚠️ **Phase 2 精簡路線沒量到排隊長度**（2026-10-18）：request-rate 掃描只記了 TTFT，轉折點約 **30 req/s**（p99 495 ms → 35 req/s 時 910 ms），但沒有同時記 `vllm:num_requests_waiting`。所以 `k8s/observability/hpa.yaml` 的 `averageValue: "2"` 目前**沒有實測依據**。補量方法：在 Phase 3 的 1 pod 上用 Phase 2 Part 2.3 的掃描指令跑 25 / 30 / 35 req/s，同時 `watch` `num_requests_waiting`（Phase 2 Part 7.1 視窗 2），取 30 req/s 時的穩態排隊長度當 `averageValue`。
+>
+> 另外，上面的壓測指令沒指定 `--seed`（預設 0）：如果同一個 pod 之前已經跑過 seed 0，prefix cache 會讓排隊變短、HPA 不容易觸發。加上一個沒用過的 `--seed`（例如 `--seed 900`）。
 
 ---
 

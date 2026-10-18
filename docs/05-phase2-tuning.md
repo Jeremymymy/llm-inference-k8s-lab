@@ -41,7 +41,7 @@ Phase 1 結束時你有一個「會動而且答案正確」的服務。Phase 2 �
 **本 workload 的特殊性必須寫進你的結論**：輸入約 150 token、輸出只有 5 token，這是一個 **prefill 主導**的 workload。含義：
 
 - 它偏向 **compute-bound**，而不是一般 chat 場景的 memory-bound
-- **量化帶來的加速會比一般情況小很多**（量化省的是記憶體頻寬）
+- **只省記憶體頻寬的量化（只壓權重）幫助不大**；要連運算都變快（例如 L4 上的 FP8 W8A8）才有效 —— 見 Part 5.3
 - KV cache 需求極小，所以並發可以開得很大
 
 **面試時這點很好用**：大部分人講的 LLM 推論常識是以 chat 為前提的。你能指出「我的 workload 是 prefill-heavy，所以那些結論不成立」，證明你是真的量過。
@@ -51,7 +51,7 @@ Phase 1 結束時你有一個「會動而且答案正確」的服務。Phase 2 �
 **四條規則，違反任何一條數字就不可比：**
 
 1. **每組先熱身 1 次（丟掉），再正式跑 1 次**（熱身是為了 CUDA graph warmup、cache 冷）。⚠️ 這是時間考量下的放寬：單次量測沒有變異數，**差距小於約 5% 的不要下結論**，`RESULTS.md` 要註明是單次
-2. **固定資料集切片與隨機種子**，不同組才可比
+2. **固定資料集切片與隨機種子**，不同組才可比 —— 但**熱身和正式要用不同的 seed**：同一個 vLLM 上重送一樣的 prompt 會命中 prefix cache，吞吐虛高好幾倍（見 Part 2.1 的 ⚠️）。本文一律熱身 `--seed 1`、正式 `--seed 2`；每組都重啟 vLLM，快取是空的，所以各組的正式那次可以共用 `--seed 2`。**同一次啟動裡的其他壓測**（掃描、固定 rate、Part 7 的觀察）各自用沒用過的 seed（例如 rate 掃描用 `1000 + rate`）
 3. **同時記正確性（MAE）與效能**。只有效能沒有正確性的數字沒有意義 —— 你可以讓一個完全答錯的服務跑得飛快
 4. **一次只改一個變數**。同時改 `--max-model-len` 和 `--max-num-seqs`，你就不知道是誰的功勞
 
@@ -82,8 +82,19 @@ docker exec vllm vllm bench serve \
   --random-input-len 150 \
   --random-output-len 5 \
   --num-prompts 500 \
-  --request-rate inf
+  --request-rate inf \
+  --seed 2 \
+  --percentile-metrics ttft,tpot,e2el \
+  --metric-percentiles 50,95,99
 ```
+
+**⚠️ 一定要指定 `--seed`，而且熱身與正式要不同。** vLLM V1 預設開 prefix caching；random dataset 預設 `seed=0`，不指定的話每次產生的 prompt 一模一樣，第二次 prefill 幾乎全部命中快取。實測（2026-10-18，vLLM 0.31.0，runtime LoRA）：同一個 seed 連跑兩次，第 1 次 35.89 req/s、命中率 1%；第 2 次 **258.34 req/s**、命中率 96%。熱身用 `--seed 1`、正式用 `--seed 2`；要確認的話看計數器：
+
+```bash
+curl -s localhost:8000/metrics | grep -E "^vllm:prefix_cache_(queries|hits)_total"
+```
+
+**`--percentile-metrics` / `--metric-percentiles`**：預設只印 mean、median 和 P99，記錄格式要的 p95 要靠這兩個旗標。
 
 **為什麼用 `docker exec` 而不是 `pip install "vllm[bench]"`**：在主機上 pip 裝 vllm 會拉一整套 torch + CUDA 函式庫，好幾 GB、十幾分鐘，而且這台機器按小時計費。`vllm/vllm-openai` 這個 image 裡本來就有 `vllm` 指令，直接借用就好。容器裡的 `localhost:8000` 就是 vLLM 自己，所以 `--base-url` 不用改。
 
@@ -114,17 +125,22 @@ docker exec vllm vllm bench serve \
 | **飽和測試** | `inf` | 「這台機器的天花板在哪」 |
 | **固定負載** | 具體數字 | 「在 X req/s 下，p99 延遲是多少」 |
 
-**固定負載的掃描是找 SLA 的方法**：從低到高掃 request-rate，畫出「負載 vs p99」的曲線。曲線開始急遽上翹的那個點，就是你的實際容量上限 —— 而它通常**遠低於**飽和吞吐。
+**固定負載的掃描是找 SLA 的方法**：從低到高掃 request-rate，畫出「負載 vs p99」的曲線。曲線開始急遽上翹的那個點，就是你的實際容量上限 —— 它**低於**飽和吞吐（本 lab 實測：轉折約 30 req/s，飽和 35.8 req/s，即 84%）。
 
 ```bash
-for rate in 5 10 20 40 80 160; do
+# 範圍先用飽和吞吐（Phase 1 ① 實測約 36 req/s）框住，轉折點在它下面
+# 每個 rate 跑約 15 秒（num-prompts = rate × 15）、各用不同 seed（避開 prefix cache）
+for rate in 10 20 25 30 35 40 50; do
   echo "=== request-rate=$rate ==="
   docker exec vllm vllm bench serve --backend openai --base-url http://localhost:8000 \
     --model pricer --tokenizer meta-llama/Llama-3.2-3B --dataset-name random \
     --random-input-len 150 --random-output-len 5 \
-    --num-prompts 300 --request-rate $rate
+    --num-prompts $((rate * 15)) --request-rate $rate --seed $((1000 + rate)) \
+    --percentile-metrics ttft,e2el --metric-percentiles 50,95,99
 done
 ```
+
+**為什麼要固定時長而不是固定筆數**：rate 一旦超過容量，佇列會隨時間線性變長，p99 取決於壓測跑了多久。固定 300 筆的話，高 rate 只跑 1–2 秒，佇列還沒排起來就結束了 —— 實測 rate 280（超過飽和吞吐）p99 還只有 237 ms，完全看不到轉折。
 
 **這條曲線是 Phase 3 設定 HPA 門檻的依據** —— 找出「排隊長度到多少時 p95 開始爆掉」，那就是 `averageValue` 該設的值。
 
@@ -154,16 +170,16 @@ docker run --rm --name vllm --gpus all --ipc=host -p 8000:8000 \
     --gpu-memory-utilization 0.85
 ```
 
-預期會看到類似這樣的錯誤，然後容器直接退出（確切措辭依 vLLM 版本而異）：
+容器會直接退出。終端最後印的是 `RuntimeError: Engine core initialization failed. See root cause above.` —— 那只是外層，真正的原因在**更上面**以 `(EngineCore ...) ERROR` 開頭的那段。2026-10-18 實測（vLLM 0.31.0）：
 
 ```
-ValueError: To serve at least one request with the models's max seq len (131072),
-(14.00 GiB KV cache is needed), which is larger than the available KV cache memory (X GiB).
-Based on the available memory, the estimated maximum model length is NNNNN.
-Try increasing `gpu_memory_utilization` or decreasing `max_model_len` ...
+ValueError: To serve at least one request with the model's max seq len (131072),
+(14.0 GiB KV cache is needed, which is larger than the available KV cache memory (9.07 GiB).
+Based on the available memory, the estimated maximum model length is 84864.
+Try increasing `gpu_memory_utilization` ... or decreasing `max_model_len` ...
 ```
 
-**把 X 和 NNNNN 記進 `RESULTS.md`。** 為什麼會這樣，見 3.2 的算式。
+**把可用 KV（9.07 GiB）和 estimated maximum model length（84864）記進 `RESULTS.md`。** 後者剛好等於 512 那組的 `KV cache size` —— KV 池的大小跟 max-model-len 無關。為什麼會這樣，見 3.2 的算式。
 
 > 如果它**起來了**（例如新版 vLLM 改了行為），那就照原計畫把 131072 當「大」那一組，第二步的 32768 直接換成 131072。
 
@@ -189,12 +205,13 @@ docker run --rm -d --name vllm --gpus all --ipc=host -p 8000:8000 \
 timeout 900 bash -c 'until curl -sf localhost:8000/health >/dev/null; do sleep 5; done' \
   || echo "沒起來，改用前景模式（拿掉 -d）重跑看錯誤"
 docker logs vllm 2>&1 | grep -E "KV cache size|Maximum concurrency"
-# 熱身 1 次 + 正式 1 次（Part 1.2），只記第二次
-for i in 1 2; do
+# 熱身 seed 1 + 正式 seed 2（Part 1.2），只記第二次
+for s in 1 2; do
   docker exec vllm vllm bench serve --backend openai --base-url http://localhost:8000 \
     --model pricer --tokenizer meta-llama/Llama-3.2-3B --dataset-name random \
     --random-input-len 150 --random-output-len 5 \
-    --num-prompts 500 --request-rate inf
+    --num-prompts 500 --request-rate inf --seed $s \
+    --percentile-metrics ttft,tpot,e2el --metric-percentiles 50,95,99
 done
 ```
 
@@ -225,11 +242,13 @@ done
                       = 114,688 bytes ≈ 112 KB
 一條 131072 token 的序列 ≈ 112 KB × 131072 ≈ 14 GiB
 
-L4 可用記憶體        ≈ 22.5 GiB × 0.85 ≈ 19 GiB
-  − bf16 權重                          ≈ 6 GiB
-  − r=256 的 LoRA 槽位、activation、CUDA graph 等  ≈ 2–3 GiB
-  = 能給 KV cache 的                   ≈ 10–11 GiB   <  14 GiB
+L4 可用記憶體        ≈ 22.5 GiB × 0.85 ≈ 19.1 GiB
+  − 權重 + r=256 的 LoRA 槽位（log：Model loading took 7.76 GiB）
+  − activation、CUDA graph（log：Graph capturing ... took 0.65 GiB）等  ≈ 2.3 GiB
+  = 能給 KV cache 的                   ≈ 9.07 GiB（實測）  <  14 GiB
 ```
+
+（原本粗估 10–11 GiB，少算了 LoRA 槽位：rank 256 × `--max-loras 2` 就佔了約 1.7 GiB。另外 vLLM 0.21 起預設把 CUDA graph 記憶體也算進 `--gpu-memory-utilization`，log 會說 0.85「相當於舊版的 0.8168」。）
 
 **vLLM 的規則是：KV cache 至少要放得下「一條最長的序列」，否則拒絕啟動。** 這比「起來了但很慢」好得多 —— 它在啟動時就告訴你設定不合理，而不是讓你在壓測時才發現。
 
@@ -242,6 +261,8 @@ L4 可用記憶體        ≈ 22.5 GiB × 0.85 ≈ 19 GiB
 | 131072（預設） | — | — | — | **起不來**：一條序列的 KV cache 就超過可用記憶體 |
 | 32768 | ≈ 相同 | 小 | ≈ 相同 | KV cache 按需分配，max-model-len 不預留空間 |
 | 512 | ≈ 相同 | **大** | ≈ 相同 | 只有「最壞情況估計」變大 |
+
+**實測（2026-10-18）**：32768 → KV 84,880 tokens、2.59x、35.92 req/s；512 → KV 84,864 tokens、165.75x、35.77 req/s。吞吐差 0.4%。
 
 **如果你量到兩組吞吐幾乎一樣，那不是你做錯了，那就是正確答案。** 跟 Part 5 的量化一樣，這是一個比「調了變快 N 倍」更有價值的結論：它證明你理解 PagedAttention，而不是在背調校清單。
 
@@ -292,9 +313,16 @@ L4 可用記憶體        ≈ 22.5 GiB × 0.85 ≈ 19 GiB
 **這就是 throughput 與 latency 的張力最直接的體現。**
 
 **精簡路線實跑這一個旋鈕**（Phase 1 合併路線的 ④）：
-- 預設值看 ① 的啟動 log：`docker logs vllm 2>&1 | grep max_num_batched_tokens`（印 `Chunked prefill is enabled with max_num_batched_tokens=N`）。依 vLLM 原始碼，顯存 < 70 GiB 的卡在 API server 模式預設 **2048**（未實測）—— 也就是一輪最多 prefill 約 13 個 150-token 的請求
-- 用 ① 的完整指令加 `--max-num-batched-tokens 8192`（約 54 個）重啟，跑一次飽和（`--request-rate inf`）和一個固定 rate（取 ① 掃描曲線上翹前的那個點），跟 ① 比吞吐與 p99 TTFT
+- 預設值：vLLM 0.31 的啟動 log **不印**這個值（只有 engine config 裡的 `enable_chunked_prefill=True`），要讀容器裡這一版的原始碼：
+
+  ```bash
+  docker exec vllm bash -c 'f=$(python3 -c "import vllm,os;print(os.path.dirname(vllm.__file__))")/engine/arg_utils.py; grep -n "OPENAI_API_SERVER\|GiB_bytes" "$f"'
+  ```
+
+  輸出是一串「顯存門檻 → 預設值」，依序是 ≥160 GiB、≥70 GiB（非 A100）、其他，後面還有 TPU、CPU 專用的分支。顯存 < 70 GiB 的 CUDA 卡（L4 是 23 GiB）在 API server 模式預設 **2048**（0.31.0 已確認）—— 也就是一輪最多 prefill 約 13 個 150-token 的請求。改過的話會出現在 log 的 `non-default args` 那行
+- 用 ① 的完整指令加 `--max-num-batched-tokens 8192`（約 54 個）重啟，跑一次飽和（`--request-rate inf`，seed 1 熱身 / seed 2 正式）和一個固定 rate（取 ① 掃描曲線上翹前的那個點，`--num-prompts` = rate × 15，用另一個沒用過的 seed），跟 ① 比吞吐、p99 TTFT 與 **TPOT**
 - 吞吐上去、p99 變差 → 典型取捨；吞吐不變 → 代表瓶頸不在批次大小（對照 Part 7 的判讀表）。**兩種都是可以寫進 `RESULTS.md` 的結論**
+- **實測（2026-10-18）是後者**：飽和 35.77 → 35.90 req/s（不變）、rate 30 的 p99 TTFT 495 → 530 ms（+7%，單次），但 **p50 TPOT 356 → 994 ms**（2.8 倍）—— decode 被更大的 prefill 批次卡住。輸出只有 5 token 所以 TTFT 看不太出來，長輸出的服務會很明顯
 
 ### 4.4 `--enforce-eager`
 
@@ -332,6 +360,10 @@ docker run --rm -d --name vllm --gpus all --ipc=host -p 8000:8000 \
 
 > L4 是 Ada 架構（compute capability 8.9），**有 FP8 硬體支援**。這是選 g6 而不是 g5 的原因 —— A10G 是 Ampere，沒有 FP8。
 
+> vLLM 0.31.0 會警告 `--quantization fp8 is deprecated for online quantization; use --quantization fp8_per_tensor instead.`，但仍正常運作（log 顯示走 `Fp8PerTensorOnlineLinearMethod`）。本 lab 實測用的是 `fp8`；`fp8_per_tensor` 未實跑，之後的版本拿掉 `fp8` 時再換。
+>
+> 確認用的是真 FP8 運算：`docker logs vllm 2>&1 | grep -E "Selected .*Kernel|Quantized"`。L4 上會看到 `CutlassFP8ScaledMMLinearKernel`（權重與運算都是 FP8）；如果是 `Marlin` 開頭的，代表只有權重存 FP8、運算時解回 bf16。
+
 **AWQ / GPTQ（選作）**：需要離線量化步驟（`llm-compressor` 或 `autoawq`），而且要跑校準資料。做完 FP8 之後如果還有時間再說，**不做也不影響結論**。
 
 ### 5.2 每一組都要量兩件事
@@ -352,20 +384,25 @@ docker logs vllm 2>&1 | grep -E "Model loading took|KV cache size"
 
 **MAE 和吞吐一定要成對記錄。** 只看吞吐的話，你會得出「量化很棒」的結論；加上 MAE 才知道代價。
 
-### 5.3 你可能會得到一個「反直覺」的結果
+### 5.3 量化會不會讓這個 workload 變快？要看它省的是什麼
 
-**量化不一定會讓這個 workload 變快。**
+**只壓權重的量化**（weight-only，例如 Marlin kernel 的 FP8、多數 AWQ/GPTQ kernel）省的是**記憶體頻寬**：權重存小一點，運算前解回 bf16。它在 decode 階段有明顯效益（每個 token 都要把整個模型權重從 HBM 讀一次）。但我們的輸出只有 5 個 token —— 絕大部分時間花在 prefill，而 prefill 是 **compute-bound**，所以這類量化幫助有限。
 
-量化省的是**記憶體頻寬**。它在 decode 階段有明顯效益（每個 token 都要把整個模型權重從 HBM 讀一次）。但我們的輸出只有 5 個 token —— 絕大部分時間花在 prefill，而 prefill 是 **compute-bound**。
+**連運算一起量化**（W8A8）就不一樣了：L4 的 FP8 tensor core 算力約是 bf16 的兩倍，compute-bound 的 prefill 也會變快。vLLM 在 L4 上做 online FP8 正是這種（`CutlassFP8ScaledMMLinearKernel`）。
 
-所以合理的結果是：
-- **權重明顯變小** ✅（6.4GB → 約 3.6GB；embedding 層仍是 bf16，所以不會剛好減半）
-- **吞吐提升有限** ⚠️
-- **MAE 略有退化** ⚠️
+**實測（2026-10-18，merged，同一套壓測參數）**：
 
-**如果你量到「量化後幾乎沒變快」，那不是你做錯了，那就是正確答案。** 而且這是一個比「量化讓我快了 2 倍」更有價值的結論，因為它顯示你理解機制而不是在背結論。
+| | bf16 | FP8 | 變化 |
+|---|---|---|---|
+| 權重（`Model loading took`） | 6.04 GiB | 3.57 GiB | −41%（embedding 與 lm_head 仍是 bf16，不會剛好減半） |
+| KV cache size | 106,400 | 127,520 | +20% |
+| 飽和吞吐 | 53.38 req/s | 73.28 req/s | **+37%** |
+| p95 TTFT | 8,966 ms | 6,512 ms | −27% |
+| MAE | $40.80 | $40.15 | <5%，沒有可量到的退化 |
 
-**但顯存下降本身就是價值**：省下的空間可以換成更多 KV cache（更高並發），或者讓 Phase 3 的 time-slicing 能塞下更多 replica。**這才是量化對本 workload 的真正好處。**
+原本的預測是「吞吐提升有限、MAE 略退化」—— 兩個都被實測推翻。這也是一個好的面試題材：**「量化省頻寬，對 compute-bound 沒用」只對 weight-only 量化成立**；要先看 log 確認選到哪個 kernel，再推論。
+
+**顯存下降也是價值**：省下的空間換成更多 KV cache（更高並發），或者讓 Phase 3 的 time-slicing 能塞下更多 replica。
 
 ---
 
@@ -406,13 +443,15 @@ print([m['id'] for m in json.load(sys.stdin)['data']])"
 傳統做法：           多 LoRA 做法：
 ┌─────────┐         ┌─────────────────────┐
 │ 團隊A模型│ GPU 1   │  一份 base 權重      │ GPU 1
-├─────────┤         │  + adapter A (0.5GB)│
-│ 團隊B模型│ GPU 2   │  + adapter B (0.5GB)│
-├─────────┤         │  + adapter C (0.5GB)│
+├─────────┤         │  + adapter A (1.5GB)│
+│ 團隊B模型│ GPU 2   │  + adapter B (1.5GB)│
+├─────────┤         │  + adapter C (1.5GB)│
 │ 團隊C模型│ GPU 3   └─────────────────────┘
 └─────────┘
   3 張卡                    1 張卡
 ```
+
+（1.5GB 是本 lab 的 rank 256 adapter 檔案大小；常見的 rank 16–64 只有幾十到幾百 MB。）
 
 **on-prem 的容量是固定的**（雲端可以再開一台，地端不行），所以這種省法的價值比在雲端高得多。
 
@@ -450,7 +489,7 @@ watch -n 1 'curl -s localhost:8000/metrics | grep -E "num_requests_(running|wait
 # 視窗 3：CPU（g6.xlarge 只有 4 vCPU）
 top
 
-# 視窗 4：壓測本身
+# 視窗 4：壓測本身（Part 2.1 的飽和指令；這個 vLLM 上已經用過的 seed 不要再用）
 docker exec vllm vllm bench serve ...
 ```
 
@@ -474,6 +513,10 @@ docker exec vllm vllm bench serve ...
 
 → **compute-bound**。這代表你已經把這張卡榨乾了，剩下的路是換卡或改架構（例如把 prefill 和 decode 分開部署，那是進階題）。
 
+**實測（2026-10-18，runtime LoRA 飽和時的尖峰）**：GPU `sm` 100%、`kv_cache_usage_perc` 0.128、`num_requests_waiting` 430、CPU 全機 28%（vLLM 程序 109%，約一顆核心）→ compute-bound，符合預測。
+
+> ⚠️ 如果 prefix cache 命中（同一個 seed 重跑），畫面會很不一樣：prefill 幾乎跳過，KV 使用率反而升到 0.43、等待數變少 —— 判讀前先確認壓測沒有重複用 seed。
+
 ### 7.4 ⚠️ 最重要的警告：`nvidia-smi` 的 GPU util 是騙人的
 
 `nvidia-smi` 的 "GPU-Util" 只回答一個問題：**「過去這段取樣區間裡，有沒有任何 kernel 在執行？」**
@@ -488,23 +531,23 @@ docker exec vllm vllm bench serve ...
 
 ## Phase 2 驗收清單
 
-- [ ] 預設 131072 的啟動結果記錄了（起不來的話，記下錯誤訊息裡的可用 KV cache 與 estimated maximum model length）
-- [ ] `--max-model-len` 兩組（32768 / 512）的 `KV cache size`、`Maximum concurrency` 與吞吐都記錄了
-- [ ] `--max-num-batched-tokens` 預設值（從 log 讀）vs 8192 的吞吐與 p99 TTFT 記錄了
-- [ ] request-rate 掃描曲線畫出來了，找到 p99 開始上翹的轉折點
-- [ ] 量化對照表至少有 bf16 與 FP8 兩組，**每組都有 MAE 和吞吐**
-- [ ] 多 LoRA：`/v1/models` 列出 `pricer` 與 `pricer2`，兩個都打得通（1 vs 2 的效能差異精簡路線跳過）
-- [ ] 能用三個訊號（GPU util / KV cache / 佇列）說出當前是哪種瓶頸，**並附上截圖或數字**
-- [ ] 所有數字進了 `RESULTS.md`
-- [ ] **機器已 `stop`**
+- [x] 預設 131072 的啟動結果記錄了（起不來的話，記下錯誤訊息裡的可用 KV cache 與 estimated maximum model length）
+- [x] `--max-model-len` 兩組（32768 / 512）的 `KV cache size`、`Maximum concurrency` 與吞吐都記錄了
+- [x] `--max-num-batched-tokens` 預設值（0.31 從原始碼讀）vs 8192 的吞吐與 p99 TTFT 記錄了
+- [x] request-rate 掃描曲線畫出來了，找到 p99 開始上翹的轉折點
+- [x] 量化對照表至少有 bf16 與 FP8 兩組，**每組都有 MAE 和吞吐**
+- [x] 多 LoRA：`/v1/models` 列出 `pricer` 與 `pricer2`，兩個都打得通（1 vs 2 的效能差異精簡路線跳過）
+- [x] 能用三個訊號（GPU util / KV cache / 佇列）說出當前是哪種瓶頸，**並附上截圖或數字**
+- [x] 所有數字進了 `RESULTS.md`
+- [x] **機器已 `stop`**
 
 ---
 
 ## 這一階段該產出的一句話
 
-在 `92-interview.md` 裡補上這段（把問號換成你的實際數字）：
+在 `92-interview.md` 裡補上這段（2026-10-18 實測數字）：
 
-> 「我的 workload 是 prefill 主導的（輸入 150 token、輸出 5 token）。很多人以為 `--max-model-len` 是最大的槓桿，我實測的結果是：預設的 131072 在 L4 上根本起不來（一條序列的 KV cache 就要 14GB），但能起來的 32768 和 512 兩組吞吐只差 ?% —— 因為 vLLM 的 KV cache 是按需分配的，max-model-len 不會預留空間，它只影響啟動檢查和『最大並發』那行最壞情況的估計。真正的瓶頸是算力：壓測時 GPU util ?%、KV cache 使用率只有 ?%，但佇列還是在長。FP8 量化把權重從 6.4GB 降到 ?GB，但吞吐只提升 ?% —— 因為量化省的是記憶體頻寬，而 prefill 是 compute-bound。」
+> 「我的 workload 是 prefill 主導的（輸入 150 token、輸出 5 token）。很多人以為 `--max-model-len` 是最大的槓桿，我實測的結果是：預設的 131072 在 L4 上根本起不來（一條序列的 KV cache 就要 14GB，可用只有 9GB），但能起來的 32768 和 512 兩組吞吐只差 0.4% —— 因為 vLLM 的 KV cache 是按需分配的，max-model-len 不會預留空間，它只影響啟動檢查和『最大並發』那行最壞情況的估計。真正的瓶頸是算力：壓測時 GPU util 100%、KV cache 使用率只有 13%，但佇列排到 430。所以加大 `--max-num-batched-tokens` 吞吐也不變，只讓 TPOT 變慢 2.8 倍。真正有效的是減少計算：把 LoRA merge 進去吞吐 +49%，再做 FP8 又 +37%，MAE 都沒變 —— FP8 有效是因為 L4 上 vLLM 用的是 W8A8 的 CUTLASS kernel，連運算都是 FP8，不只是省頻寬。另外我差點被 prefix cache 騙：壓測同一個 seed 重跑，吞吐從 36 跳到 258 req/s。」
 
 ---
 

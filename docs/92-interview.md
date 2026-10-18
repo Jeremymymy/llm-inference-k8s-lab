@@ -35,15 +35,17 @@
 
 > 「我刻意先用純 Docker 跑 vLLM，不一開始就上 k8s。因為 GPU 問題的排查順序是由下往上 —— `nvidia-smi` → `docker run --gpus all` → device plugin → pod。一開始就疊 k8s，出問題時分不清是哪一層。
 >
-> 這個階段我刻意對照了兩種失敗。我的 adapter 是 r=256，vLLM 的 `--max-lora-rank` 預設是 16 —— 不設的話 vLLM **啟動時就拒絕**，這是大聲的錯誤，很好處理。真正危險的是無聲的那種：請求的 model 名稱打到 base，服務正常啟動、健康檢查通過、API 正常回應合法的價格數字，但 MAE 從 $? 變成 $?。**只有業務層面的正確性驗證抓得到這個錯誤。** 這件事讓我意識到推論服務的部署流程需要一道 MAE 門檻檢查，光有 health check 不夠。」
+> 這個階段我刻意對照了兩種失敗。我的 adapter 是 r=256，vLLM 的 `--max-lora-rank` 預設是 16 —— 不設的話 vLLM **啟動時就拒絕**，這是大聲的錯誤，很好處理。真正危險的是無聲的那種：請求的 model 名稱打到 base，服務正常啟動、健康檢查通過、API 正常回應合法的價格數字，但 MAE 從 $40.74 變成 $200.29。**只有業務層面的正確性驗證抓得到這個錯誤。** 這件事讓我意識到推論服務的部署流程需要一道 MAE 門檻檢查，光有 health check 不夠。」
 
 ### Phase 2 —— 效能調校
 
 > 「我的 workload 是 **prefill 主導**的：輸入約 150 token、輸出只有 5 token。這個特性推翻了很多 LLM 推論的『常識』。
 >
-> 很多人以為 `--max-model-len` 是最大的槓桿，我實測的結果是：預設的 131072 在 L4 上根本起不來 —— 一條 131072 token 序列的 KV cache 就要約 14GB，比扣掉權重後的可用空間還大，vLLM 直接拒絕啟動。但能起來的 32768 和 512 兩組，吞吐只差 ?%。因為 vLLM 的 KV cache 是按需分配的（PagedAttention），max-model-len 不會替每個請求預留空間 —— 它只影響啟動檢查，和 log 裡『最大並發』那個最壞情況的估計。
+> 很多人以為 `--max-model-len` 是最大的槓桿，我實測的結果是：預設的 131072 在 L4 上根本起不來 —— 一條 131072 token 序列的 KV cache 就要約 14GB，比扣掉權重後的可用空間還大，vLLM 直接拒絕啟動。但能起來的 32768 和 512 兩組，吞吐只差 0.4%（35.92 vs 35.77 req/s），KV cache 都是約 84,900 token。因為 vLLM 的 KV cache 是按需分配的（PagedAttention），max-model-len 不會替每個請求預留空間 —— 它只影響啟動檢查，和 log 裡『最大並發』那個最壞情況的估計。
 >
-> 量化的結果也是反直覺的：FP8 把權重從 6.4GB 降到 ?GB，但吞吐只提升了 ?%。因為量化省的是**記憶體頻寬**，而 prefill 是 compute-bound。不過權重變小本身有價值 —— 在一張卡上跑多個 replica 時，真正的限制是「每個 pod 都要一份權重」，不是 KV cache。」
+> 真正的瓶頸是算力：飽和時 GPU util 100%、KV cache 只用了 13%，佇列卻排到 430。所以把 `--max-num-batched-tokens` 從 2048 調到 8192 吞吐也不變，反而讓 TPOT 慢了 2.8 倍。有效的是減少計算量：把 r=256 的 LoRA merge 進去，吞吐 +49%；再做 FP8，又 +37%，MAE 都沒變（$40.74 → $40.80 → $40.15）。FP8 會變快，是因為 L4 上 vLLM 選的是 W8A8 的 CUTLASS kernel，連運算都是 FP8 —— 『量化只省頻寬、對 compute-bound 沒用』只對 weight-only 量化成立。權重變小（6.04 → 3.57 GiB）也有價值 —— 在一張卡上跑多個 replica 時，真正的限制是「每個 pod 都要一份權重」，不是 KV cache。
+>
+> 我還差點被 prefix cache 騙：壓測工具預設用同一個 seed，第二次跑命中率 96%，吞吐從 36 跳到 258 req/s。所以我的量測規則是熱身與正式一定用不同的 seed。」
 
 ### Phase 3 —— GPU 上的 k8s
 
@@ -161,7 +163,7 @@
 | MetalLB | on-prem 的 LoadBalancer 會一直 `<pending>`；MetalLB 的 L2 模式是**故障轉移不是負載平衡**（流量全走一個節點），要真分流得用 BGP | docs/03 Part 4 |
 | CronJob | `concurrencyPolicy` 預設 `Allow` 會越積越多；不設 `startingDeadlineSeconds` 停機後會補跑；沒有 `ttlSecondsAfterFinished` 會讓 etcd 膨脹 | docs/03 Part 10 |
 | NetworkPolicy | CNI 不執行時 apply 成功但完全沒效果（kindnet 就是）；model-server 適合幾乎全封，只放 pricer-api 進、DNS 出 | docs/03 Part 11 |
-| `--max-lora-rank` | 預設 16，adapter 是 r=256 → vLLM **啟動就失敗**（大聲失敗，好處理）。危險的是反面：請求打到 base，一切綠燈但 MAE 變 $110 | docs/04 Part 5 |
+| `--max-lora-rank` | 預設 16，adapter 是 r=256 → vLLM **啟動就失敗**（大聲失敗，好處理）。危險的是反面：請求打到 base，一切綠燈但 MAE 變 $200 | docs/04 Part 5 |
 | `--gpu-memory-utilization` | time-slicing 時每個 pod 的值要除以 pod 數，而且每份都要放得下權重 + 開銷；k8s 對顯存一無所知 | docs/05 Part 4.1 |
 | `--max-num-seqs` | 同時跑的序列上限，調大吞吐↑、個別延遲↑；L4 這級的卡預設 256 | docs/05 Part 4.2 |
 | `--enforce-eager` | 關 CUDA graph：啟動快、執行慢；只在 debug 或啟動時間敏感時用 | docs/05 Part 4.4 |
