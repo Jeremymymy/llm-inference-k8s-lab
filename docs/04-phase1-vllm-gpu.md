@@ -85,7 +85,22 @@ aws ssm get-parameters --region us-east-1 \
   --query 'Parameters[0].Value' --output text
 ```
 
-開機（把 `<AMI>` / `<KEYPAIR>` / `<SG>` 換成你的）：
+建 key pair 與安全群組（第一次才需要，之後重用）：
+
+```bash
+# key pair：私鑰只能在建立時下載這一次，存進 private/（已 gitignore）
+aws ec2 create-key-pair --region us-east-1 --key-name pricer-lab \
+  --key-type ed25519 --query KeyMaterial --output text > private/pricer-lab.pem
+chmod 400 private/pricer-lab.pem      # 權限太寬的話 ssh 會拒絕使用
+
+# 安全群組（建在 default VPC）：印出的 sg-xxx 就是下面的 <SG>
+# 剛建好時什麼都不准進，開 22 的規則見 1.3
+aws ec2 create-security-group --region us-east-1 \
+  --group-name pricer-lab-sg --description "pricer lab: ssh from my IP only" \
+  --query GroupId --output text
+```
+
+開機（`<AMI>` 換成上面查到的、`<KEYPAIR>` 是 `pricer-lab`、`<SG>` 是剛拿到的 `sg-xxx`）：
 
 ```bash
 aws ec2 run-instances --region us-east-1 \
@@ -130,6 +145,19 @@ ssh -i <key> -L 8000:localhost:8000 ubuntu@<公有IP>
 
 - **`stop` 不是 `terminate`。** stop 之後 EBS 還在（每月約 $12），下次 start 模型快取還在，不用重下載。terminate 則是全部消失。
 - **stop/start 後公有 IP 會變**（除非綁 Elastic IP，但閒置的 EIP 也要收費）。每次重連前先查新 IP。
+- **你家的 IP 也會變**（家用網路、換地方、開手機熱點）。症狀是 `ssh` 卡住然後 `Operation timed out` —— 不是 `Permission denied`，因為封包在安全群組就被擋掉了。把新 IP 加進去，舊的順手刪掉：
+
+  ```bash
+  MY_IP=$(curl -s https://checkip.amazonaws.com)
+  aws ec2 authorize-security-group-ingress --region us-east-1 \
+    --group-id <SG> --protocol tcp --port 22 --cidr "${MY_IP}/32"
+
+  # 看目前放行了哪些 IP，把舊的刪掉
+  aws ec2 describe-security-groups --region us-east-1 --group-ids <SG> \
+    --query 'SecurityGroups[0].IpPermissions[].IpRanges[].CidrIp'
+  aws ec2 revoke-security-group-ingress --region us-east-1 \
+    --group-id <SG> --protocol tcp --port 22 --cidr <舊IP>/32
+  ```
 - **spot 便宜 60–70% 但會被中斷。** 學習階段可以用，但要接受「跑到一半機器不見了」。模型快取在 EBS 上所以損失有限。
 - 開機後**第一件事**就是設好關機提醒。真的。
 
