@@ -114,9 +114,11 @@ scripts/aws-check.sh              # 預設 us-east-1
 scripts/aws-check.sh us-west-2    # 其他 region
 ```
 
-檢查上面的五項（執行中的機器、閒置 EBS、未綁定 EIP、NAT Gateway、Load Balancer）。有資源時每一筆底下會印出對應的清理指令（只印、不執行）。
+檢查六項（執行中的機器、停機中保留的 EBS、閒置 EBS、未綁定 EIP、NAT Gateway、Load Balancer）。有資源時每一筆底下會印出對應的清理指令（只印、不執行）。
 
-**五個區塊全是「（無）」= 你今天不會被收錢。** 結束碼：`0` 全空、`2` 有資源、`1` 憑證或查詢失敗。
+**六個區塊全是「（無）」= 你今天不會被收錢。** 結束碼：`0` 全空、`2` 有資源、`1` 憑證或查詢失敗。
+
+⚠️ **每天收工 stop 之後，結束碼還是 `2`，這是正確的**：「停機中保留的 EBS」那段會列出 stopped 機器和它的 root volume（150GB gp3 約 $12/月）。還要用這台機器就是刻意保留，忽略它；印出的 `terminate-instances` 只有整個階段做完、數據抓回本機之後才跑 —— terminate 會連硬碟一起刪（`DeleteOnTermination=true`）。（2026-10-18 之前的版本漏查這一項：stop 後會誤報「全空」。）
 
 ---
 

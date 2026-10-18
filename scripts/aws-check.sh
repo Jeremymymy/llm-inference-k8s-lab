@@ -27,6 +27,11 @@ section() {
 section "執行中的機器" "aws ec2 stop-instances --region $R --instance-ids {}" \
   aws ec2 describe-instances --filters "Name=instance-state-name,Values=running,pending" \
   --query 'Reservations[].Instances[].[InstanceId,InstanceType,State.Name]'
+# stop 的機器不收運算費，但掛著的 EBS 照收（gp3 約 $0.08/GB/月）；status 是 in-use，下一段查不到
+section "停機中保留的 EBS（刻意保留就忽略；不要了才 terminate，硬碟一起刪）" \
+  "aws ec2 terminate-instances --region $R --instance-ids {}" \
+  aws ec2 describe-instances --filters "Name=instance-state-name,Values=stopped,stopping" \
+  --query "Reservations[].Instances[].[InstanceId, join(',', BlockDeviceMappings[].Ebs.VolumeId)]"
 section "閒置的 EBS（確認不要了再刪）" "aws ec2 delete-volume --region $R --volume-id {}" \
   aws ec2 describe-volumes --filters "Name=status,Values=available" \
   --query 'Volumes[].[VolumeId,Size]'
@@ -41,7 +46,7 @@ section "Load Balancer" "aws elbv2 delete-load-balancer --region $R --load-balan
 echo
 case $found in
   0) echo "✅ 全空，今天不會被收錢" ;;
-  2) echo "⚠️  有資源在收費，照上面 → 的指令清理（Phase 4 的 NAT / LB 照 docs/07 拆）" ;;
+  2) echo "⚠️  有資源在收費，照上面 → 的指令清理（Phase 4 的 NAT / LB 照 docs/07 拆；停機保留的 EBS 若還要用就忽略）" ;;
   *) echo "❌ 有查詢失敗，結果不可信" ;;
 esac
 exit "$found"
