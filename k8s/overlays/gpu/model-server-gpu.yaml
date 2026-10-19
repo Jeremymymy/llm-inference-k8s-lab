@@ -66,11 +66,16 @@ spec:
             # ⚠️ time-slicing 時要除以同卡上的 pod 數，而且每一份都要放得下權重 + 開銷（見 docs/06 Part 7.2）
             - --gpu-memory-utilization
             - "0.85"
-          ports:
-            - name: http
-              containerPort: 8000      # vLLM 預設 8000，llama.cpp 是 8080
+            # 聽 base 的 8080（vLLM 預設 8000）。不另外宣告 8000：strategic merge 會留下 base 的
+            # 8080 port，兩個都叫 http 會撞名。放最後，docs/06 Part 7 的 args/12 索引才不會變
+            - --port
+            - "8080"
 
           env:
+            # base 以 uid 10001 跑，vLLM image 的 HOME 是 /root（不可寫）；
+            # torch.compile / Triton 的快取都寫 ~/.cache，指到可寫的 /tmp
+            - name: HOME
+              value: /tmp
             - name: HF_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -100,9 +105,12 @@ spec:
             failureThreshold: 5
 
           resources:
+            # g6.xlarge 只有 4 vCPU / 約 15 GiB 可分配。requests 只影響排程：
+            # 要讓 time-slicing 的 2～3 個 pod 排得上（docs/06 Part 7），瓶頸才會落在顯存而不是 CPU/記憶體。
+            # Phase 2 實測 vLLM 約用 1.1 顆核心。
             requests:
-              cpu: "2"
-              memory: 8Gi
+              cpu: 500m
+              memory: 4Gi
               # extended resource 的規則：只能是整數、requests 必須等於 limits、
               # 不可超賣。這跟 CPU 完全不同。
               nvidia.com/gpu: "1"

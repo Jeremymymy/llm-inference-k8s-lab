@@ -54,7 +54,7 @@
 | 9. 可觀測性 + HPA | ⏭️ 跳過 | 跟 Phase 0 重複（Prometheus、prometheus-adapter、HPA 都在 Phase 0 實跑過），又要再裝整套 stack，最花時間 |
 | 10. Helm 實務 | 📖 讀就好 | 那幾個指令與陷阱讀過、能講就夠 |
 
-**bench pod 在 Part 6 建立**，Part 7 的對照表和 Part 8 的 DCGM 觀察都用它產生壓測負載（指令見 Part 9.3 的 `kubectl exec bench -- vllm bench serve ...`，只借那一段，不用裝 Prometheus）。做完 Part 8 就 `kubectl -n pricer delete pod bench`。
+**bench pod 在 Part 6 建立**，Part 7 的對照表和 Part 8 的 DCGM 觀察都用它產生壓測負載（指令見 Part 7.1 的 `kubectl exec bench -- vllm bench serve ...`；每次換一個這個 pod 沒用過的 `--seed`，避開 prefix cache）。做完 Part 8 就 `kubectl -n pricer delete pod bench`。
 
 **驗收清單照做，但跳過 HPA 那兩項**（「HPA 實際擴容」、「HPA 門檻已校正」），並在 `KNOWN-GAPS.md` 誠實記一筆：「HPA 接 vLLM 指標只做到設計，未在 GPU 上實跑」。
 
@@ -69,6 +69,9 @@
 nvidia-smi          # DLAMI 已經有驅動了，先確認
 
 # 1) NVIDIA Container Toolkit（讓容器看得到 GPU）
+# 這顆 AMI 已預裝（Phase 1 的 docker run --gpus all 能跑就是靠它），先用下面兩個指令檢查，有了就跳過底下的安裝
+nvidia-ctk --version
+dpkg -l | grep nvidia-container-toolkit
 curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
   | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
 curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
@@ -80,8 +83,14 @@ sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit
 curl -sfL https://get.k3s.io | sh -
 
 sudo chmod 644 /etc/rancher/k3s/k3s.yaml
-export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+# 寫進 bashrc：之後另開的 SSH 視窗（壓測、觀察）才都連得到叢集
+echo 'export KUBECONFIG=/etc/rancher/k3s/k3s.yaml' >> ~/.bashrc
+source ~/.bashrc
 kubectl get nodes
+
+# 3) helm 要裝在這台機器上：Mac 上的 helm 連不到 k3s 的 API（安全群組只開 22）
+curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+helm version
 ```
 
 ### 1.2 為什麼順序是「先 toolkit 再 k3s」
@@ -100,16 +109,23 @@ kubectl get nodes
 kubectl get runtimeclass
 # 應該看到 nvidia
 
+# k3s 產生的 containerd 設定裡真的有 nvidia runtime 嗎（1.2 說的「先 toolkit 再 k3s」生效了沒）
+sudo grep -n nvidia /var/lib/rancher/k3s/agent/etc/containerd/config.toml
+
 # 直接在容器裡確認看得到 GPU
-sudo ctr image pull docker.io/nvidia/cuda:12.4.0-base-ubuntu22.04
-sudo ctr run --rm --gpus 0 \
+# 用 `k3s ctr` 而不是 `ctr`：這顆 AMI 有 Docker 自帶的 /usr/bin/ctr，連的是 Docker 的 containerd，
+# k3s 安裝時可能因此不建 ctr 捷徑（推論，未實測；`which -a ctr` 可確認）
+sudo k3s ctr image pull docker.io/nvidia/cuda:12.4.0-base-ubuntu22.04
+sudo k3s ctr run --rm --gpus 0 \
   docker.io/nvidia/cuda:12.4.0-base-ubuntu22.04 gputest nvidia-smi
 ```
+
+> `ctr run --gpus` 是 ctr 自己呼叫 NVIDIA 的工具把卡塞進容器，**不經過** containerd 設定裡的 `nvidia` runtime（推論，未實測）。所以它證明的是「toolkit + 驅動在 k3s 的 containerd 底下可用」；「pod 走 `runtimeClassName: nvidia` 拿得到卡」要等 Part 4.3 的 `kubectl exec ... nvidia-smi` 才算數。上面的 `grep` 是兩者之間的那一步。
 
 ### ⚠️ 陷阱
 
 - **這是「由下往上」排查順序的第二層。** 如果這一步失敗，不要往上去查 k8s —— 問題在 runtime 層。Phase 1 已經用 `docker run --gpus all` 驗過第一層了，所以你知道驅動是好的。
-- **k3s 預設會裝 Traefik 當 ingress**。跟 Phase 0 用的 ingress-nginx 不同。要嘛接受（改 `ingressClassName: traefik`），要嘛 `--disable traefik` 再自己裝 nginx。**這是「在我機器上可以跑」的另一個來源** —— ingress annotation 是廠商特定的，nginx 的那些 `proxy-buffering` annotation 在 Traefik 上完全無效。
+- **k3s 預設會裝 Traefik 當 ingress**。跟 Phase 0 用的 ingress-nginx 不同。要嘛接受（改 `ingressClassName: traefik`），要嘛 `--disable traefik` 再自己裝 nginx。**這是「在我機器上可以跑」的另一個來源** —— ingress annotation 是廠商特定的，nginx 的那些 `proxy-buffering` annotation 在 Traefik 上完全無效。**本 Phase 不用 Ingress**（壓測都是 bench pod 直接打 Service），保留預設的 Traefik 即可；不要為此裝 ingress-nginx —— 它已於 2026-03 退役（見 `docs/02` Part 7）。
 
 ---
 
@@ -161,7 +177,19 @@ kubectl get nodes -o jsonpath='{.items[0].metadata.labels}' | tr ',' '\n' | grep
 
 ## Part 3：把模型與憑證放進叢集
 
+先把 lab repo 弄上機器。repo 是 private、EC2 上也沒有 GitHub 憑證，所以不用 `git clone`，從**本機**推上去：
+
 ```bash
+# 本機，repo 根目錄：本 Phase 在機器上只用到 k8s/（manifest、Helm values）和 src/（build pricer-api）
+rsync -a -e "ssh -i private/pricer-lab.pem" k8s src ubuntu@<IP>:~/llm-inference-k8s-lab/
+```
+
+只推這兩個資料夾，不要推整個 repo：`models/`（Phase 0 的 GGUF，約 5.4GB）、`private/`（憑證）、`bench-raw/` 都是 gitignored 但在本機上，用 `--exclude` 列黑名單很容易漏。`eval/measure.py` 是在本機跑的（透過 SSH 通道），不用推。改了 manifest 之後重跑同一行就會同步。
+
+之後都在 GPU 機器上：
+
+```bash
+cd ~/llm-inference-k8s-lab
 kubectl apply -f k8s/base/namespace.yaml
 
 # 憑證做成 Secret（從檔案建，避免手動複製貼上）
@@ -175,7 +203,7 @@ kind: PersistentVolumeClaim
 metadata: { name: model-weights }
 spec:
   accessModes: ["ReadWriteOnce"]
-  resources: { requests: { storage: 60Gi } }
+  resources: { requests: { storage: 20Gi } }   # 必須跟 k8s/base/model-server.yaml 一致，見下方
 EOF
 
 kubectl -n pricer apply -f - <<'EOF'
@@ -198,9 +226,11 @@ kubectl -n pricer cp /home/ubuntu/adapter loader:/models/adapter
 kubectl -n pricer delete pod loader
 ```
 
-**為什麼 PVC 要 60Gi**：不只放 adapter，還要放 HF cache（`HF_HOME=/models/hf`）。bf16 權重 6.4GB，加上你在 Phase 2 做的各種量化版本，很快就會超過 20GB。
+**為什麼是 20Gi、而且要跟 base 一樣**：Part 4 的 `kubectl apply -k` 會套用 `k8s/base/model-server.yaml` 裡同名的 PVC（20Gi）。這裡建得比它大的話，等於要把 PVC 改小 —— k8s 不允許縮小 PVC，apply 會在這個物件上報錯（推論，未實測）。而且 k3s 預設的 `local-path` StorageClass **不會強制執行大小**：PVC 只是節點上的一個資料夾，真正的上限是 EBS 剩下的空間（Phase 1+2 跑完約剩 59G）。PVC 裡會放 adapter（1.5GB）和 HF cache（`HF_HOME=/models/hf`，bf16 權重約 6.4GB）。
 
 **為什麼 HF cache 要放 PVC**：不然每次 pod 重啟都要重新從 HF 下載 6.4GB。在 k8s 裡 pod 重啟是家常便飯（滾動更新、OOM、節點維護），每次等 5 分鐘不可接受。
+
+**PVC 跟 Phase 1/2 的 `~/hf-cache` 是什麼關係**：在 `local-path` 上，PVC 是 `/var/lib/rancher/k3s/storage/pvc-<uid>_pricer_model-weights/` 這個資料夾，跟 `~/hf-cache`、`~/adapter` 在**同一顆 EBS 上，但內容不共用**。所以 Part 4 第一次起 vLLM pod 時，會再從 HF 下載一次 6.4GB 到 PVC 裡（之後重啟就直接讀 PVC）。不必手動把 `~/hf-cache` 複製進去 —— 這次啟動剛好就是「k8s 裡含權重下載的冷啟動」，記下來給 `startupProbe` 當依據（Phase 1 docker 實測 249 秒）。
 
 ---
 
@@ -209,17 +239,26 @@ kubectl -n pricer delete pod loader
 ### 4.1 做法
 
 ```bash
-# 把 lab repo 弄上機器（或 git clone）
+# repo 已在 Part 3 用 rsync 推上機器
 cd ~/llm-inference-k8s-lab
 
 docker build -t pricer-api:dev src/pricer-api
-sudo k3s ctr images import <(docker save pricer-api:dev)   # k3s 用自己的 image store
+# k3s 用自己的 image store（跟 Docker 的分開）。先存成檔案再匯入：
+# `sudo ... <(docker save ...)` 不行 —— sudo 會關掉 <(...) 用的那個檔案描述子
+docker save -o /tmp/pricer-api.tar pricer-api:dev
+sudo k3s ctr images import /tmp/pricer-api.tar && rm /tmp/pricer-api.tar
 
 kubectl kustomize k8s/overlays/gpu | less     # 先看再 apply
 kubectl apply -k k8s/overlays/gpu
 
 kubectl -n pricer get pods -w
 ```
+
+**第一次會等很久，分兩段**：
+1. `ContainerCreating` 好幾分鐘 —— k3s 從 registry 拉 vLLM image（10GB+）。Phase 1 用 Docker 拉過的那份**不算數**，兩邊的 image store 分開。這段不計入 `startupProbe`。
+2. `Running` 但還沒 `READY` —— 下載權重進 PVC（6.4GB）+ 編譯（k8s 裡沒有 `~/vllm-cache`）。這段就是 Part 3 說的「k8s 冷啟動」，記下 pod 建立到 Ready 的秒數；`startupProbe` 給了 900 秒（Phase 1 docker 冷啟動實測 249 秒）。
+
+overlay 把 vLLM image 鎖在 Phase 1/2 量測用的 digest（vLLM 0.31.0，`k8s/overlays/gpu/kustomization.yaml`），跟前面的數字才可比。
 
 ### 4.2 base 跟 overlay 的差異一覽
 
@@ -230,10 +269,12 @@ kubectl -n pricer get pods -w
 | 三種 probe 的結構 | ✅ | 只調 `failureThreshold`（90 vs 60） |
 | `preStop` + grace period | ✅ | 不變 |
 | `/dev/shm` 的 emptyDir | ✅ | 不變（Phase 0 就預留了） |
-| securityContext | ✅ | 不變 |
+| securityContext（uid 10001、非 root） | ✅ | 不變，但要加 `HOME=/tmp`：vLLM image 的 HOME 是不可寫的 `/root`，編譯快取寫不進去 |
+| container port 8080 | ✅ | 不變：vLLM 加 `--port 8080` 去聽它（預設 8000）。overlay 若另外宣告 8000，strategic merge 會留下 base 的 8080，兩個都叫 `http` 會撞名 |
 | Service / ConfigMap / PVC | ✅ | 不變 |
 | pricer-api 整個 | ✅ | 不變 |
-| image 與 args | llama.cpp | **vLLM** |
+| image 與 args | llama.cpp | **vLLM**（鎖 digest） |
+| requests / limits | cpu 2、記憶體 6Gi / limit 8Gi | cpu 500m、4Gi / limit 12Gi：4 vCPU、約 15 GiB 的機器要排得下 Part 7 的 2～3 個 pod |
 | `nvidia.com/gpu` | — | **新增** |
 | `runtimeClassName: nvidia` | — | **新增** |
 | toleration + nodeSelector | — | **新增** |
@@ -247,7 +288,7 @@ kubectl -n pricer get pods -w
 # pod 真的拿到卡了嗎（排查順序的第四層）
 kubectl -n pricer exec deploy/model-server -- nvidia-smi
 
-kubectl -n pricer port-forward svc/model-server 8000:8080 &   # 本機 8000 → Service 的 8080（再轉到容器的 8000）
+kubectl -n pricer port-forward svc/model-server 8000:8080 &   # 機器上的 8000 → Service 的 8080（容器也是 8080）；本機的 SSH 通道 -L 8000:localhost:8000 接到這裡
 curl -s localhost:8000/v1/models | python3 -m json.tool
 ```
 
@@ -355,8 +396,11 @@ strategy: maxSurge: 1, maxUnavailable: 0
 **先開一個 bench pod**（叢集內的「客戶端」，Part 7、8、9 的壓測也都用它）：
 
 ```bash
-# vLLM image 在 Part 4 已經被拉進 k3s 了，不用再下載；這個 pod 不要求 GPU
-kubectl -n pricer run bench --image=vllm/vllm-openai:latest \
+# 用跟 model-server 同一個 digest（k8s/overlays/gpu/kustomization.yaml）：Part 4 已拉進 k3s，不用再下載；
+# 寫 :latest 的話是另一個 image，會再拉 10GB+（下面 120 秒的 wait 會逾時），bench 工具版本也可能跟 server 不同
+# 這個 pod 不要求 GPU
+kubectl -n pricer run bench \
+  --image=vllm/vllm-openai@sha256:c1c9f6fd5c109ba7f0546a59f5b2f15fb87f64c77782e90a27b648b42a8e67c3 \
   --env="HF_TOKEN=$(cat ~/private/hf-token)" \
   --command -- sleep infinity
 kubectl -n pricer wait --for=condition=Ready pod/bench --timeout=120s
@@ -369,6 +413,9 @@ kubectl -n pricer patch deploy/model-server --type=json -p='[
   {"op":"replace","path":"/spec/strategy/rollingUpdate/maxSurge","value":0},
   {"op":"replace","path":"/spec/strategy/rollingUpdate/maxUnavailable","value":1}
 ]'
+# ⚠️ 6.1 那個卡住的 rollout 會在這一刻自己完成（先停舊 pod、再起新 pod）—— 這次的停機不量。
+# 等它跑完再往下：
+kubectl -n pricer rollout status deploy/model-server --timeout=15m
 
 # 終端 1：每秒打一次，印出時間戳與結果
 kubectl -n pricer exec bench -- python3 -u -c "
@@ -400,6 +447,24 @@ kubectl -n pricer rollout restart deploy/model-server
 
 ### 7.1 做法
 
+**先量 7.3 表的第一列「1 pod 獨佔（0.85）」**—— 改成 0.42 之後就量不到了。從 bench pod 打 Service，熱身 seed 1、正式 seed 2（理由見 Phase 2 Part 1.2），只記第二次：
+
+```bash
+mkdir -p ~/bench-raw          # 壓測輸出都存這裡，收工時 scp 回本機
+for s in 1 2; do
+  kubectl -n pricer exec bench -- vllm bench serve --backend openai \
+    --base-url http://model-server:8080 \
+    --model pricer --tokenizer meta-llama/Llama-3.2-3B --dataset-name random \
+    --random-input-len 150 --random-output-len 5 --num-prompts 500 --request-rate inf \
+    --seed $s --percentile-metrics ttft,tpot,e2el --metric-percentiles 50,95,99 \
+    2>/dev/null | tee ~/bench-raw/7-1pod-seed$s.txt
+done
+```
+
+MAE 用 Part 4.3 的 `eval/measure.py`（label `phase3-k3s-1pod`）。⚠️ Part 4.3 開的 `port-forward` 綁的是當時那個 pod，Part 6 已經把它換掉了 —— 先 `pkill -f "port-forward svc/model-server"`，再重跑 Part 4.3 那行 `port-forward` 才量得到（之後每次 pod 被換掉都一樣）。Phase 1 docker 版的參考值：35.77 req/s（多掛了 `pricer2 --max-loras 2`，不完全同條件）。
+
+然後開 time-slicing：
+
 ```bash
 kubectl apply -f k8s/overlays/gpu/time-slicing-config.yaml
 
@@ -415,27 +480,47 @@ kubectl get node -o jsonpath='{.items[0].metadata.labels}' | tr ',' '\n' | grep 
 # nvidia.com/gpu.replicas=3
 ```
 
-**現在必須把每個 pod 的 `--gpu-memory-utilization` 調小**（理由與數字見 7.2）。先用 1 個 replica，把 Part 6 的死結解開：
+**現在必須把每個 pod 的 `--gpu-memory-utilization` 調小**（理由與數字見 7.2）。
+
+**這一次改 0.42 要用 `Recreate`（舊 pod 完全結束、顯存釋放後才起新的）**：舊 pod 還是 0.85（約 19 GiB），新 pod 只要跟它並存，就只看得到約 3 GiB 可用顯存，起不來。`maxSurge: 1 / maxUnavailable: 0` 會卡死；Part 6 的 `maxSurge: 0 / maxUnavailable: 1` 也不保險 —— RollingUpdate 不等舊 pod 結束，開了 time-slicing 後新 pod 馬上拿得到切片，可能在舊 pod 的 preStop／關機期間就啟動、先 crash 一次。`Recreate` 會等舊 pod 全部結束。
 
 ```bash
 # 先確認 "0.85" 在 args 裡的索引 —— 照 overlay 的寫法是 12（11 是旗標名稱本身）
 kubectl -n pricer get deploy model-server -o jsonpath='{.spec.template.spec.containers[0].args}' | tr ',' '\n' | cat -n
 
+# 改顯存比例 + 這一次用 Recreate（會停機一次）
 kubectl -n pricer patch deploy/model-server --type=json -p='[
   {"op":"replace","path":"/spec/template/spec/containers/0/args/12","value":"0.42"},
-  {"op":"replace","path":"/spec/strategy/rollingUpdate/maxSurge","value":1},
-  {"op":"replace","path":"/spec/strategy/rollingUpdate/maxUnavailable","value":0}
+  {"op":"replace","path":"/spec/strategy","value":{"type":"Recreate"}}
 ]'
-kubectl -n pricer rollout status deploy/model-server
+kubectl -n pricer rollout status deploy/model-server --timeout=15m
+
+# 之後的 pod 都是 0.42，新舊並存塞得下（0.42 × 2 = 0.84）—— 改回零停機的滾動更新
+kubectl -n pricer patch deploy/model-server --type=json -p='[
+  {"op":"replace","path":"/spec/strategy","value":{"type":"RollingUpdate","rollingUpdate":{"maxSurge":1,"maxUnavailable":0}}}
+]'
 ```
 
-這次 rollout 不會卡住：新 pod 拿到第 2 個切片，新舊兩個 pod 各 0.42，加起來 0.84 塞得進一張卡。**⚠️ 索引寫錯（例如 11）會把 `--gpu-memory-utilization` 這個旗標本身換掉，vLLM 會因為參數錯誤起不來。**
+**⚠️ 索引寫錯（例如 11）會把 `--gpu-memory-utilization` 這個旗標本身換掉，vLLM 會因為參數錯誤起不來。**
 
-再擴到 2 個 replica，量 7.3 的表：
+再擴到 2 個 replica，量 7.3 表的第二列。prefix cache 存在每個 vLLM 程序裡、pod 一換就沒了 —— 0.42 那次 rollout 已經換掉 pod，兩個 pod 的 cache 都是空的；照慣例仍換新的 seed 3 熱身、seed 4 正式：
 
 ```bash
 kubectl -n pricer scale deploy/model-server --replicas=2
+kubectl -n pricer rollout status deploy/model-server --timeout=15m
+kubectl -n pricer logs -l app=model-server --tail=-1 | grep -E "KV cache size|Maximum concurrency"   # 7.2 的推算對不對
+
+for s in 3 4; do
+  kubectl -n pricer exec bench -- vllm bench serve --backend openai \
+    --base-url http://model-server:8080 \
+    --model pricer --tokenizer meta-llama/Llama-3.2-3B --dataset-name random \
+    --random-input-len 150 --random-output-len 5 --num-prompts 500 --request-rate inf \
+    --seed $s --percentile-metrics ttft,tpot,e2el --metric-percentiles 50,95,99 \
+    2>/dev/null | tee ~/bench-raw/7-2pod-seed$s.txt
+done
 ```
+
+MAE 一樣用 `eval/measure.py`（label `phase3-k3s-2pod-timesliced`；pod 又換過了，先重開 `port-forward`）。注意 `port-forward svc/...` 只會連到其中一個 pod（見 Part 9.3），兩個 pod 是同一份設定，MAE 量一個就夠。
 
 ### 7.2 為什麼這個 workload 特別適合示範
 
@@ -559,7 +644,7 @@ curl -s localhost:9400/metrics | grep -E "DCGM_FI_DEV_GPU_UTIL|DCGM_FI_PROF_SM_A
 
 ### 8.3 實際觀察
 
-壓測跑著的時候，同時看這三個數字：
+壓測跑著的時候（另一個視窗跑 Part 7.1 的飽和指令，換一個沒用過的 seed，例如 `--seed 5`），同時看這三個數字：
 
 ```bash
 watch -n 1 'curl -s localhost:9400/metrics | grep -E "^DCGM_FI_DEV_GPU_UTIL|^DCGM_FI_PROF_SM_ACTIVE|^DCGM_FI_PROF_PIPE_TENSOR_ACTIVE"'
@@ -604,7 +689,7 @@ helm install monitoring prometheus-community/kube-prometheus-stack \
   --set prometheus.prometheusSpec.retention=24h
 ```
 
-ServiceMonitor 只要改一個字（vLLM 的 port 是 8000，metrics 路徑一樣）：
+ServiceMonitor 不用改（vLLM 在 overlay 裡也聽 8080、port 名字一樣叫 `http`，metrics 路徑一樣）：
 
 ```bash
 kubectl apply -f k8s/observability/servicemonitor.yaml
@@ -660,7 +745,7 @@ kubectl -n pricer get hpa model-server -w
 kubectl -n pricer delete pod bench
 ```
 
-**為什麼不從 port-forward 打**：`kubectl port-forward svc/...` 其實只會連到**其中一個** pod，不會分流。HPA 擴出來的新 pod 根本拿不到流量，你會看到「擴容了但延遲沒改善」這種假象。走 Service（`model-server:8080`，Service 的 port 是 8080，轉到容器的 8000）才會被 kube-proxy 分到所有 replica。
+**為什麼不從 port-forward 打**：`kubectl port-forward svc/...` 其實只會連到**其中一個** pod，不會分流。HPA 擴出來的新 pod 根本拿不到流量，你會看到「擴容了但延遲沒改善」這種假象。走 Service（`model-server:8080`，Service 和容器都是 8080）才會被 kube-proxy 分到所有 replica。
 
 `--tokenizer` 為什麼必須寫，見 Phase 2 Part 2.1。
 
@@ -724,8 +809,8 @@ helm rollback gpu-operator 1 -n gpu-operator        # 回滾
 **這是最後一個要花錢的階段。做完之後務必清乾淨。**
 
 ```bash
-# 1. 先把數據抓回本機（很重要，機器刪了就沒了）
-scp -i <key> -r ubuntu@<IP>:~/bench-results ./bench-raw/
+# 1. 先把數據抓回本機（很重要，機器刪了就沒了）：本 Phase 的壓測輸出都 tee 在 ~/bench-raw（Part 7.1）
+scp -i private/pricer-lab.pem -r ubuntu@<IP>:~/bench-raw ./
 
 # 2. 停機（保留 EBS，之後想重來可以直接 start）
 aws ec2 stop-instances --region us-east-1 --instance-ids <ID>
@@ -733,13 +818,8 @@ aws ec2 stop-instances --region us-east-1 --instance-ids <ID>
 # 3. 確定不再需要了才 terminate
 aws ec2 terminate-instances --region us-east-1 --instance-ids <ID>
 
-# 4. ⚠️ 檢查孤兒資源（terminate 不一定會清乾淨）
-aws ec2 describe-volumes --region us-east-1 \
-  --filters "Name=status,Values=available" \
-  --query 'Volumes[].[VolumeId,Size,CreateTime]' --output table
-
-aws ec2 describe-addresses --region us-east-1 \
-  --query 'Addresses[?AssociationId==null].[PublicIp,AllocationId]' --output table
+# 4. ⚠️ 檢查孤兒資源（terminate 不一定會清乾淨）：六個區塊全是「（無）」、結束碼 0 才算清乾淨
+scripts/aws-check.sh
 ```
 
 **閒置的 EBS volume 和未綁定的 Elastic IP 會一直收費。** 這是「我以為我刪光了」帳單的頭號來源。

@@ -11,6 +11,9 @@ resources:
 images:
   - name: pricer-api
     newTag: dev
+  # 鎖成 Phase 1/2 實測用的那一版（vLLM 0.31.0，見 RESULTS.md），數字才可比
+  - name: vllm/vllm-openai
+    digest: sha256:c1c9f6fd5c109ba7f0546a59f5b2f15fb87f64c77782e90a27b648b42a8e67c3
 
 patches:
   - path: model-server-gpu.yaml
