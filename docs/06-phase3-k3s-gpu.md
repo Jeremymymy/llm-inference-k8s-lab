@@ -563,7 +563,7 @@ L4 顯存（nvidia-smi 顯示）        ≈ 22.5 GiB
 ### 7.4 四個必須能講的陷阱
 
 1. **完全沒有記憶體隔離。** 兩個 pod 共用同一塊 24GB HBM，**k8s 對此一無所知**。兩個 pod 都用預設的 `--gpu-memory-utilization 0.9` → 第二個直接 CUDA OOM。這是最常見的翻車點。
-2. **沒有故障隔離。** 一個 pod 觸發 XID error，同卡上所有 pod 一起死。
+2. **沒有故障隔離。** XID 是 NVIDIA 驅動回報的錯誤代碼（`sudo dmesg | grep -i xid`）。硬體或驅動層級的 XID（例如 48 ECC 錯誤、79 GPU 掉出 PCIe 匯流排）要重置整張卡，同卡上所有 pod 一起掛；應用層的錯誤（例如 13、31 記憶體存取違規）通常只終止出錯的那個程序，但 time-slicing 不保證其他 pod 沒事。
 3. **`nvidia.com/gpu: 3` 是謊報。** scheduler 以為有三張卡，對記憶體壓力毫無感知。**這正是 production 要用 MIG 的理由。** （選作，精簡路線讀就好）親眼看一次：2 個 replica 時再 `rollout restart`，第 3 個 pod 會**排程成功**（拿到第 3 個切片），然後在啟動時因為顯存不夠而 CrashLoop —— 不是 `Pending`。死結又回來了，只是這次卡在 k8s 看不到的地方。看完用 `kubectl -n pricer rollout undo deploy/model-server` 收回。
 4. **效能非線性。** 見上面那張表。
 

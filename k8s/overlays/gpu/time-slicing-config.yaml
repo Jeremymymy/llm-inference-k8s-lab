@@ -17,7 +17,8 @@
 #   1. 完全沒有記憶體隔離。兩個 pod 共用同一塊 24GB HBM，而 k8s 對此一無所知。
 #      兩個 pod 都用預設的 --gpu-memory-utilization 0.9 → 第二個直接 CUDA OOM。
 #      這是最常見的翻車點。
-#   2. 沒有故障隔離。一個 pod 觸發 XID error，同卡上所有 pod 一起死。
+#   2. 沒有故障隔離。硬體/驅動層級的 XID（例如 48、79）要重置整張卡，同卡所有 pod 一起掛；
+#      應用層的錯誤（例如 13、31）通常只終止出錯的程序，但 time-slicing 不保證其他 pod 沒事。
 #   3. nvidia.com/gpu: N 是謊報。scheduler 以為有 N 張卡，
 #      對記憶體壓力毫無感知。這正是 production 要用 MIG 的理由。
 #   4. 效能非線性。context switch 有成本，總吞吐會略降、p99 會明顯惡化。
@@ -46,10 +47,10 @@ data:
         # false = 資源名稱維持 nvidia.com/gpu（而不是 nvidia.com/gpu.shared）。
         # 維持原名的好處是 Deployment 完全不用改就能享受 time-slicing。
         renameByDefault: false
-        # false = 允許一個容器 request 超過 1 個切片。
-        # 設 true 的話，request 大於 1 會直接失敗 —— 那是比較安全的預設，
-        # 但我們要在單卡上演練多 replica，所以放寬。
-        failRequestsGreaterThanOne: false
+        # true = 一個容器 request 超過 1 個切片就直接失敗。
+        # 切片全是同一張卡，要 2 個不會多拿到算力或顯存，只是多佔名額 —— 直接拒絕，避免誤用。
+        # 每個 pod 只要 1 個切片（多 replica = 多個 pod 各要 1 個），不受影響。
+        failRequestsGreaterThanOne: true
         resources:
           - name: nvidia.com/gpu
             replicas: 3        # 一張 L4 → 對 k8s 宣告成 3 張
