@@ -66,6 +66,7 @@
 | 未微調的 base model（本 repo eval，vLLM bf16） | $200.29 | 「LoRA 沒生效」的指紋 |
 | llama.cpp Q8_0 + LoRA（Mac） | $40.79 | Phase 0 |
 | vLLM bf16 + LoRA rank 256 | $40.74 | Phase 1 主線 |
+| 同上，跑在 k3s 裡 | $40.79 | Phase 3；與主線一致 → k8s 這層沒改變行為 |
 | vLLM bf16 + **預設 rank 16** | — | 刻意重現的大聲失敗（啟動即拒絕；精簡路線未實跑） |
 | vLLM bf16 + merged 權重 | $40.80 | 與主線一致 |
 | vLLM FP8 + merged 權重 | $40.15 | 沒有可量到的量化代價 |
@@ -79,14 +80,16 @@
 | `--max-model-len 512`（runtime LoRA） | 35.77 req/s | 13,341 ms | 84,864 |
 | merged bf16 | 53.38 req/s | 8,966 ms | 106,400 |
 | FP8 量化（merged） | 73.28 req/s | 6,512 ms | 127,520 |
-| time-slicing 2 replica | — | — | — |
+| k3s 1 pod（0.85，runtime LoRA） | 34.54 req/s | p99 14,198 ms | 93,952 |
+| time-slicing 2 replica（各 0.42） | 28.13 req/s（−19%） | p99 17,442 ms | 5,232 / pod |
 
 ### 成本
 
 | 階段 | 花費 |
 |---|---|
 | Phase 0 + 0.5（本機） | $0 |
-| Phase 1–3（GPU） | — |
+| Phase 1–2（GPU） | — |
+| Phase 3（GPU，約 3.5 小時） | 約 $2.8（不含 EBS） |
 
 ---
 
@@ -96,7 +99,7 @@
 - [x] **Phase 0.5** — kind 三節點：排程、drain/PDB、資源治理（$0）
 - [x] **Phase 1** — 雲端 GPU + vLLM 服務化與正確性驗證（精簡路線，2026-10-18）
 - [x] **Phase 2** — 效能調校、壓測、量化對照（精簡路線，2026-10-18）
-- [ ] **Phase 3** — k3s + GPU + time-slicing + DCGM
+- [x] **Phase 3** — k3s + GPU + time-slicing + DCGM（精簡路線，2026-10-20；HPA 未在 GPU 上實跑）
 - [ ] **Phase 4** — EKS 雲端↔地端對照（選作）
 
 ---

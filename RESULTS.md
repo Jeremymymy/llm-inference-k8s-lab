@@ -33,7 +33,7 @@
 | 4 | 2026-10-18 | GPU / vLLM | bf16 | merged | $40.80 | 72.0% | 74.0% | 與 #2 一致 ✅ |
 | 5 | 2026-10-18 | GPU / vLLM | bf16 | 無（base） | $200.29 | -695.9% | 48.5% | **不是** leaderboard 的 $110；解析正確，base 常猜 `1,999.99` 這類價格，誤差最大 8 筆占總誤差 30% |
 | 6 | 2026-10-18 | GPU / vLLM | **FP8** | merged | $40.15 | 73.4% | 75.5% | 量化代價（跟 #4 比） |
-| 7 | | k3s / vLLM | bf16 | runtime, rank 256 | | | | **應與 #2 完全一致** |
+| 7 | 2026-10-20 | k3s / vLLM | bf16 | runtime, rank 256 | $40.79 | 71.9% | 75.0% | 與 #2 一致（差 $0.05）；同設定再量一次 $40.78、time-sliced 2 pod $40.53 —— vLLM 併發下批次組合每次不同，bf16 有微小雜訊，不是逐位元可重現 |
 
 **#2 vs #5 的差距** = 請求打到 base（無聲失敗）的代價：$159.55（MAE 變成約 5 倍）—— 在這套評估裡，「LoRA 沒生效」的指紋是 **約 $200**
 **#2 vs #1 的差距** = Q8_0 量化的代價：−$0.05（0.1%，單次量測不下結論）—— Q8_0 對這個任務幾乎無損
@@ -165,11 +165,18 @@ LoRA 預留約 1.7 GiB 顯存（rank 256 × 2 個 slot），KV 少 20%；吞吐�
 
 | 設定 | 吞吐 (req/s) | p50 TTFT | **p99 TTFT** | MAE | 顯存/pod |
 |---|---|---|---|---|---|
-| 1 pod 獨佔 | | | | | |
-| 2 pod time-sliced | | | | | |
-| 3 pod time-sliced（選作：bf16 放不下，需 FP8 merged） | | | | | |
+2026-10-20，k3s、vLLM 0.31.0、runtime LoRA r=256，bench pod 打 Service，`--request-rate inf`、500 筆，熱身一次後的正式那次。
 
-**結論**：___
+| 設定 | 吞吐 (req/s) | p50 TTFT | **p99 TTFT** | MAE | 顯存/pod |
+|---|---|---|---|---|---|
+| 1 pod 獨佔（0.85） | 34.54 | 7,532 ms | 14,198 ms | $40.78 | 18,780 MiB；KV 93,952 tokens（並發上限 183） |
+| 1 pod（0.42，對照組） | 30.86 | 8,268 ms | 15,930 ms | — | 9,068 MiB；KV 5,232 tokens（並發上限 10.2） |
+| 2 pod time-sliced（各 0.42） | 28.13 | 8,957 ms | 17,442 ms | $40.53 | 9,068 MiB × 2；KV 各 5,232 tokens |
+| 3 pod time-sliced（選作：bf16 放不下，需 FP8 merged） | 未做 | | | | |
+
+`Model loading took` 兩種設定都是 6.9 GiB（權重 + 1 個 r=256 LoRA 槽位），跟 docs/06 Part 7.2 的推算一致；但 KV 實測 5,232 tokens，推算的約 2,000 太悲觀。
+
+**結論**：2 pod 合計吞吐比 1 pod 獨佔**少 19%**，p99 TTFT 多 23%。加了對照組才拆得開：顯存切成 0.42、KV 只剩約 10 個請求的並發，就先掉 10.7%（34.54 → 30.86）；兩個 pod 輪流用 GPU 再掉 8.8%（30.86 → 28.13）。這個 compute-bound 的 workload 上，time-slicing 換不到吞吐，換到的是「同時跑兩份」與「rollout 不必停機」；代價約一半來自每個 pod 分到的顯存變小，一半來自切換本身。MAE 不受影響。
 
 ---
 
@@ -179,12 +186,14 @@ LoRA 預留約 1.7 GiB 顯存（rank 256 × 2 個 slot），KV 少 20%；吞吐�
 
 | 指標 | 數值 | 意義 |
 |---|---|---|
-| `DCGM_FI_DEV_GPU_UTIL` | | 「有 kernel 在跑」—— **會騙人** |
-| `DCGM_FI_PROF_SM_ACTIVE` | | SM 真實佔用率 |
-| `DCGM_FI_PROF_PIPE_TENSOR_ACTIVE` | | Tensor Core 使用率 |
+| `DCGM_FI_DEV_GPU_UTIL` | 99% | 「有 kernel 在跑」—— **會騙人** |
+| `DCGM_FI_PROF_SM_ACTIVE` | 0.95 | SM 上至少有一個 warp 的時間比例 |
+| `DCGM_FI_PROF_PIPE_TENSOR_ACTIVE` | 0.52 | Tensor Core 真正在做矩陣乘法的時間比例 |
 
-**GPU_UTIL 與 SM_ACTIVE 的落差**：___
-**這代表**：___
+條件：2026-10-20，1 pod（0.42，time-slicing 開著但只有 1 個 pod），2000 筆、`--request-rate inf`、seed 8，30.99 req/s。exporter 約 **30 秒**更新一次，`PROF_*` 是那 30 秒的平均；取的是整段都落在壓測期間的那一筆（05:10:59 → 05:11:30）。原始取樣在 `bench-raw/8-dcgm.txt`。
+
+**GPU_UTIL 與 SM_ACTIVE 的落差**：幾乎沒有（99% vs 95%）—— 推翻 docs/06 Part 8.3「SM_ACTIVE 明顯更低」的預期。落差在下一層：Tensor Core 只有 52% 的時間在算。
+**這代表**：SM 都排滿了工作（compute-bound，跟 Phase 2 的瓶頸判讀一致），但最貴的 Tensor Core 只用了一半，其餘時間在跑 attention、逐元素運算、取樣與資料搬移。「GPU_UTIL 100% = 卡滿了」只對一半；要提高產出該往「讓更多時間跑在 Tensor Core 上」想 —— FP8 在 L4 上 prefill +37%（量化對照）就是這個方向。
 
 ---
 
@@ -195,7 +204,9 @@ LoRA 預留約 1.7 GiB 顯存（rank 256 × 2 個 slot），KV 少 20%；吞吐�
 | llama.cpp 冷啟動（Mac，CPU） | 約 70 秒（權重已在 PVC；2026-09-27 rollout 實測，建立→ready） | Phase 0 的 `startupProbe` |
 | vLLM 冷啟動（含權重下載） | 249 秒（runtime LoRA；image 已先 pull，`~/vllm-cache` 是空的；`Model loading took` 61 秒） | |
 | vLLM 冷啟動（權重已快取） | 121 秒（runtime LoRA 與 merged bf16 都是；`Model loading` 6–35 秒，其餘是編譯與 CUDA graph capture） | **Phase 3 的 `startupProbe` 與 HPA 穩定視窗** |
-| 單卡滾動更新的停機時間 | | 「該不該多買一張卡」的決策依據 |
+| k8s 冷啟動（含下載權重進 PVC） | 230 秒（image 已先 `crictl pull`；pod 建立 → Ready；`Model loading` 61 秒） | k3s 的 `startupProbe`（給 900 秒） |
+| k8s 重啟（權重已在 PVC、沒有編譯快取） | 201 秒（比 docker 的 121 秒多：k8s 裡沒有 `~/vllm-cache`） | |
+| 單卡滾動更新的停機時間 | **191 秒**（選項 A：`maxSurge 0 / maxUnavailable 1`；bench pod 每秒打 Service，第一個 DOWN → 第一個 200） | 「該不該多買一張卡」的決策依據 |
 
 ---
 
@@ -203,6 +214,6 @@ LoRA 預留約 1.7 GiB 顯存（rank 256 × 2 個 slot），KV 少 20%；吞吐�
 
 | 日期 | 階段 | 機器時數 | 花費 | 累計 |
 |---|---|---|---|---|
-| | | | | |
+| 2026-10-20 | Phase 3（g6.xlarge，$0.8048/hr） | 約 3.5 | 約 $2.8（不含 EBS） | |
 
 **預算上限：$80（月預算警示）**

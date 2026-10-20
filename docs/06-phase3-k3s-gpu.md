@@ -114,7 +114,7 @@ sudo grep -n nvidia /var/lib/rancher/k3s/agent/etc/containerd/config.toml
 
 # 直接在容器裡確認看得到 GPU
 # 用 `k3s ctr` 而不是 `ctr`：這顆 AMI 有 Docker 自帶的 /usr/bin/ctr，連的是 Docker 的 containerd，
-# k3s 安裝時可能因此不建 ctr 捷徑（推論，未實測；`which -a ctr` 可確認）
+# k3s 安裝時因此不建 ctr 捷徑（2026-10-20 實測：`which -a ctr` 只有 /usr/bin/ctr）
 sudo k3s ctr image pull docker.io/nvidia/cuda:12.4.0-base-ubuntu22.04
 sudo k3s ctr run --rm --gpus 0 \
   docker.io/nvidia/cuda:12.4.0-base-ubuntu22.04 gputest nvidia-smi
@@ -246,7 +246,13 @@ docker build -t pricer-api:dev src/pricer-api
 # k3s 用自己的 image store（跟 Docker 的分開）。先存成檔案再匯入：
 # `sudo ... <(docker save ...)` 不行 —— sudo 會關掉 <(...) 用的那個檔案描述子
 docker save -o /tmp/pricer-api.tar pricer-api:dev
-sudo k3s ctr images import /tmp/pricer-api.tar && rm /tmp/pricer-api.tar
+# ⚠️ 一定要 --all-platforms：這顆 AMI 的 Docker 29 用 containerd image store，docker save 出來是「index 包 index」，
+# 不加的話 ctr 印 `saved` 但什麼都沒匯入，pricer-api 會 ImagePullBackOff（2026-10-20 實測）
+sudo k3s ctr images import --all-platforms /tmp/pricer-api.tar && rm /tmp/pricer-api.tar
+sudo k3s crictl images | grep pricer          # 要看得到才算匯入成功
+
+# 先把 vLLM image 拉進 k3s（2026-10-20 實測 9GB、約 4 分 40 秒），下面量的冷啟動才不含下載
+sudo k3s crictl pull docker.io/vllm/vllm-openai@sha256:c1c9f6fd5c109ba7f0546a59f5b2f15fb87f64c77782e90a27b648b42a8e67c3
 
 kubectl kustomize k8s/overlays/gpu | less     # 先看再 apply
 kubectl apply -k k8s/overlays/gpu
@@ -255,8 +261,12 @@ kubectl -n pricer get pods -w
 ```
 
 **第一次會等很久，分兩段**：
-1. `ContainerCreating` 好幾分鐘 —— k3s 從 registry 拉 vLLM image（10GB+）。Phase 1 用 Docker 拉過的那份**不算數**，兩邊的 image store 分開。這段不計入 `startupProbe`。
-2. `Running` 但還沒 `READY` —— 下載權重進 PVC（6.4GB）+ 編譯（k8s 裡沒有 `~/vllm-cache`）。這段就是 Part 3 說的「k8s 冷啟動」，記下 pod 建立到 Ready 的秒數；`startupProbe` 給了 900 秒（Phase 1 docker 冷啟動實測 249 秒）。
+1. 拉 vLLM image（10GB+）—— 上面已經用 `crictl pull` 先拉了。Phase 1 用 Docker 拉過的那份**不算數**，兩邊的 image store 分開。這段不計入 `startupProbe`。
+2. `Running` 但還沒 `READY` —— 下載權重進 PVC（6.4GB）+ 編譯（k8s 裡沒有 `~/vllm-cache`）。這段就是 Part 3 說的「k8s 冷啟動」，記下 pod 建立到 Ready 的秒數；`startupProbe` 給了 900 秒（2026-10-20 實測 **230 秒**，Phase 1 docker 249 秒）：
+
+```bash
+kubectl -n pricer get pod -l app=model-server -o jsonpath='{.items[0].metadata.creationTimestamp}{"  →  "}{.items[0].status.conditions[?(@.type=="Ready")].lastTransitionTime}{"\n"}'
+```
 
 overlay 把 vLLM image 鎖在 Phase 1/2 量測用的 digest（vLLM 0.31.0，`k8s/overlays/gpu/kustomization.yaml`），跟前面的數字才可比。
 
@@ -301,7 +311,7 @@ uv run --with datasets eval/measure.py \
   --label "phase3-k3s-vllm-bf16"
 ```
 
-**MAE 應該跟 Phase 1 的 Docker 版完全一樣。** 如果不一樣，代表 k8s 這一層改變了什麼 —— 最常見的是請求打到了 `base` 而不是 `pricer`（pricer-api 的 `MODEL_NAME`、或 args 裡的 `--served-model-name` / `--lora-modules` 名稱對不上）。
+**MAE 應該跟 Phase 1 的 Docker 版一致（差距 <1%）。** 2026-10-20 實測 $40.79 vs Phase 1 的 $40.74，同設定再量一次是 $40.78 —— vLLM 在併發請求下每次湊成的批次不同，bf16 數值有微小差異，不會逐位元相同（Phase 0 的 llama.cpp 才是 4 次完全相同）。如果差很多（例如接近 $200），代表 k8s 這一層改變了什麼 —— 最常見的是請求打到了 `base` 而不是 `pricer`（pricer-api 的 `MODEL_NAME`、或 args 裡的 `--served-model-name` / `--lora-modules` 名稱對不上）。
 
 ### ⚠️ 陷阱：排程成功，但容器裡沒有 GPU
 
@@ -435,6 +445,8 @@ kubectl -n pricer rollout restart deploy/model-server
 
 **停機時間 = 第一個 `DOWN` 到下一個 `200` 之間的秒數。** 把它記進 `RESULTS.md`。這是選項 A 的真實成本，也是說服老闆買第二張卡的數據。
 
+> **2026-10-20 實測：191 秒。** 新 pod 建立 → Ready 是 201 秒（比 docker 權重已快取的 121 秒多，因為 k8s 裡沒有編譯快取），但第一個 `DOWN` 比新 pod 建立晚 10 秒。推論（未驗證）：舊 pod 在 preStop 期間已是 terminating，但 Service 沒有其他 Ready 的 endpoint 時，kube-proxy 會繼續把流量送給 terminating 的 pod，直到程序真的停掉。
+
 **為什麼不從本機透過 port-forward 打**：`port-forward` 在建立時就綁定**某一個 pod**。舊 pod 一被刪，port-forward 就斷了，而且新 pod 起來後它**不會自動接上** —— 你會看到 `000` 一路延續下去，量到的是「port-forward 斷了多久」，不是服務停了多久。從 bench pod 打 Service 才會在新 pod Ready 的那一刻自動恢復。
 
 > 用 Python 而不是 `curl`，是因為 vLLM image 一定有 Python，但不保證有 curl。
@@ -461,7 +473,17 @@ for s in 1 2; do
 done
 ```
 
-MAE 用 Part 4.3 的 `eval/measure.py`（label `phase3-k3s-1pod`）。⚠️ Part 4.3 開的 `port-forward` 綁的是當時那個 pod，Part 6 已經把它換掉了 —— 先 `pkill -f "port-forward svc/model-server"`，再重跑 Part 4.3 那行 `port-forward` 才量得到（之後每次 pod 被換掉都一樣）。Phase 1 docker 版的參考值：35.77 req/s（多掛了 `pricer2 --max-loras 2`，不完全同條件）。
+MAE 用 Part 4.3 的 `eval/measure.py`（label `phase3-k3s-1pod`）。⚠️ Part 4.3 開的 `port-forward` 綁的是當時那個 pod，Part 6 已經把它換掉了 —— 先關掉舊的再重開才量得到（之後每次 pod 被換掉都一樣）：
+
+```bash
+# 不能用 pkill -f "port-forward ..."：k3s 的 kubectl 是指向 k3s 的捷徑，會改寫自己的命令列，
+# ps / pgrep 只看得到「kubectl」，pkill -f 比對不到（2026-10-20 實測）。改成按 port 殺：
+fuser -k 8000/tcp; sleep 1
+kubectl -n pricer port-forward svc/model-server 8000:8080 > /tmp/pf.log 2>&1 &
+sleep 3; cat /tmp/pf.log      # 要看到 Forwarding from 127.0.0.1:8000
+```
+
+Phase 1 docker 版的參考值：35.77 req/s（多掛了 `pricer2 --max-loras 2`，不完全同條件）；2026-10-20 k3s 實測 34.54 req/s。
 
 然後開 time-slicing：
 
@@ -485,11 +507,10 @@ kubectl get node -o jsonpath='{.items[0].metadata.labels}' | tr ',' '\n' | grep 
 **這一次改 0.42 要用 `Recreate`（舊 pod 完全結束、顯存釋放後才起新的）**：舊 pod 還是 0.85（約 19 GiB），新 pod 只要跟它並存，就只看得到約 3 GiB 可用顯存，起不來。`maxSurge: 1 / maxUnavailable: 0` 會卡死；Part 6 的 `maxSurge: 0 / maxUnavailable: 1` 也不保險 —— RollingUpdate 不等舊 pod 結束，開了 time-slicing 後新 pod 馬上拿得到切片，可能在舊 pod 的 preStop／關機期間就啟動、先 crash 一次。`Recreate` 會等舊 pod 全部結束。
 
 ```bash
-# 先確認 "0.85" 在 args 裡的索引 —— 照 overlay 的寫法是 12（11 是旗標名稱本身）
-kubectl -n pricer get deploy model-server -o jsonpath='{.spec.template.spec.containers[0].args}' | tr ',' '\n' | cat -n
-
 # 改顯存比例 + 這一次用 Recreate（會停機一次）
+# 照 overlay 的寫法 "0.85" 在 args/12（11 是旗標名稱本身）。第一行 "test" 先核對，索引不對整個 patch 就被拒絕、什麼都不改
 kubectl -n pricer patch deploy/model-server --type=json -p='[
+  {"op":"test","path":"/spec/template/spec/containers/0/args/12","value":"0.85"},
   {"op":"replace","path":"/spec/template/spec/containers/0/args/12","value":"0.42"},
   {"op":"replace","path":"/spec/strategy","value":{"type":"Recreate"}}
 ]'
@@ -501,7 +522,7 @@ kubectl -n pricer patch deploy/model-server --type=json -p='[
 ]'
 ```
 
-**⚠️ 索引寫錯（例如 11）會把 `--gpu-memory-utilization` 這個旗標本身換掉，vLLM 會因為參數錯誤起不來。**
+**⚠️ 索引寫錯（例如 11）會把 `--gpu-memory-utilization` 這個旗標本身換掉，vLLM 會因為參數錯誤起不來** —— 上面的 `test` 就是擋這個。
 
 再擴到 2 個 replica，量 7.3 表的第二列。prefix cache 存在每個 vLLM 程序裡、pod 一換就沒了 —— 0.42 那次 rollout 已經換掉 pod，兩個 pod 的 cache 都是空的；照慣例仍換新的 seed 3 熱身、seed 4 正式：
 
@@ -520,7 +541,21 @@ for s in 3 4; do
 done
 ```
 
-MAE 一樣用 `eval/measure.py`（label `phase3-k3s-2pod-timesliced`；pod 又換過了，先重開 `port-forward`）。注意 `port-forward svc/...` 只會連到其中一個 pod（見 Part 9.3），兩個 pod 是同一份設定，MAE 量一個就夠。
+MAE 一樣用 `eval/measure.py`（label `phase3-k3s-2pod-timesliced`；pod 又換過了，先照上面用 `fuser` 重開 `port-forward`）。注意 `port-forward svc/...` 只會連到其中一個 pod（見 Part 9.3），兩個 pod 是同一份設定，MAE 量一個就夠。
+
+**再量一組對照：1 pod、0.42。** 2 pod 那組同時改了兩件事（顯存切小、兩個 pod 輪流用 GPU），不加這組就分不出吞吐掉的是哪一個的代價。縮回 1 個時留下的那個 pod 可能還有 seed 3、4 的 prefix cache，換 seed 5、6：
+
+```bash
+kubectl -n pricer scale deploy/model-server --replicas=1
+for s in 5 6; do
+  kubectl -n pricer exec bench -- vllm bench serve --backend openai \
+    --base-url http://model-server:8080 \
+    --model pricer --tokenizer meta-llama/Llama-3.2-3B --dataset-name random \
+    --random-input-len 150 --random-output-len 5 --num-prompts 500 --request-rate inf \
+    --seed $s --percentile-metrics ttft,tpot,e2el --metric-percentiles 50,95,99 \
+    2>/dev/null > ~/bench-raw/7-1pod-042-seed$s.txt
+done
+```
 
 ### 7.2 為什麼這個 workload 特別適合示範
 
@@ -541,7 +576,9 @@ L4 顯存（nvidia-smi 顯示）        ≈ 22.5 GiB
 > 2 pod × 0.42 → 9.45 − 6.9 − 2.3 ≈ 0.25 GiB 給 KV cache（約 2,000 token）
 > ```
 >
-> 仍大於 `--max-model-len 512` 的啟動門檻，所以**應該起得來，但很緊**：並發上限變低，任何多一點的開銷（例如改成 `--max-loras 2`）就可能放不下。實跑時記下兩個 pod 各自的 `KV cache size`，填回這裡。
+> 仍大於 `--max-model-len 512` 的啟動門檻，所以**應該起得來，但很緊**：並發上限變低，任何多一點的開銷（例如改成 `--max-loras 2`）就可能放不下。
+>
+> **2026-10-20 實測**：兩個 pod 都起來了。`Model loading took` 6.9 GiB ✅（跟推算一致）；`KV cache size` 各 **5,232 tokens**（約 0.57 GiB，並發上限 10.2）—— 推算的約 2,000 太悲觀，非 KV 開銷在 0.42 下比 0.85 時小。`nvidia-smi` 每個程序 9,068 MiB。
 
 > ⚠️ **單 pod 容量參考**（Phase 2，2026-10-18，docker 單獨跑、runtime LoRA、0.85）：飽和約 36 req/s，p99 TTFT 轉折點約 30 req/s。time-sliced 的兩個 pod 共用同一張卡的算力（compute-bound），**總和**預期不會超過這個數。
 
@@ -554,9 +591,12 @@ L4 顯存（nvidia-smi 顯示）        ≈ 22.5 GiB
 | 設定 | 吞吐 (req/s) | p50 TTFT | **p99 TTFT** | MAE |
 |---|---|---|---|---|
 | 1 pod 獨佔整張卡（0.85） | | | | |
+| 1 pod（0.42，對照組） | | | | — |
 | 2 pod time-sliced（各 0.42） | | | | |
 
 **預期結果**：總吞吐略降（context switch 有成本），但 **p99 會明顯惡化**。
+
+> **2026-10-20 實測（數字見 `RESULTS.md`）**：降得不只「略」—— 34.54 → 28.13 req/s（−19%），p99 TTFT +23%（`--request-rate inf` 下 p99 TTFT 約等於整批跑完的時間，主要跟著吞吐走）。對照組拆出來：顯存切成 0.42 先掉 10.7%，兩個 pod 輪流用 GPU 再掉 8.8%。MAE 不受影響（$40.53）。
 
 **這張表勝過任何架構圖。** 面試時它證明的是「我知道 time-slicing 的代價，而且我量過」。
 
@@ -626,6 +666,8 @@ kubectl -n gpu-operator rollout status ds/nvidia-dcgm-exporter
 ```
 
 > DaemonSet 名稱依 GPU Operator 版本可能不同，對不上就 `kubectl -n gpu-operator get ds | grep dcgm` 看實際名字。L4 支不支援 profiling（`PROF_*`）指標要在機器上確認：下一步 `curl` 若連 `PIPE_TENSOR_ACTIVE` 都沒有，就是硬體或驅動不支援，記進 `KNOWN-GAPS.md`。
+>
+> 2026-10-20 實測（GPU Operator v26.7.2，image `4.6.1-4.8.4`）：git tag `4.6.1-4.8.4` 是 404，`4.8.4` 抓得到；原清單 `SM_ACTIVE` 確實被註解掉；L4 三個指標都有值。
 
 ```bash
 kubectl -n gpu-operator get pods | grep dcgm
@@ -644,13 +686,24 @@ curl -s localhost:9400/metrics | grep -E "DCGM_FI_DEV_GPU_UTIL|DCGM_FI_PROF_SM_A
 
 ### 8.3 實際觀察
 
-壓測跑著的時候（另一個視窗跑 Part 7.1 的飽和指令，換一個沒用過的 seed，例如 `--seed 5`），同時看這三個數字：
+**⚠️ exporter 約每 30 秒才更新一次，`PROF_*` 是那 30 秒的平均**（2026-10-20 實測：數值在 05:10:59、05:11:30、05:11:58 才跳）。500 筆的壓測只跑約 15 秒、`vllm bench serve` 自己啟動又要十幾秒，取樣 25 秒會全是 0。所以壓測放大到 2000 筆（約 65 秒）、取樣 90 秒、附時間戳，旁邊用 `nvidia-smi` 當對照；**只採用整段 30 秒都落在壓測期間的那一筆**。換一個這個 pod 沒用過的 seed：
 
 ```bash
-watch -n 1 'curl -s localhost:9400/metrics | grep -E "^DCGM_FI_DEV_GPU_UTIL|^DCGM_FI_PROF_SM_ACTIVE|^DCGM_FI_PROF_PIPE_TENSOR_ACTIVE"'
+M='^DCGM_FI_(DEV_GPU_UTIL|PROF_SM_ACTIVE|PROF_PIPE_TENSOR_ACTIVE)'
+kubectl -n pricer exec bench -- vllm bench serve --backend openai \
+  --base-url http://model-server:8080 \
+  --model pricer --tokenizer meta-llama/Llama-3.2-3B --dataset-name random \
+  --random-input-len 150 --random-output-len 5 --num-prompts 2000 --request-rate inf \
+  --seed 8 2>/dev/null | grep "Request throughput" &
+for i in $(seq 45); do
+  echo "$(date +%T) $(curl -s localhost:9400/metrics | grep -E "$M" | sed -E 's/\{.*\}//; s/DCGM_FI_(DEV_|PROF_)//' | tr '\n' ' ') smi=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits)"
+  sleep 2
+done | tee ~/bench-raw/8-dcgm.txt
 ```
 
-**你很可能會看到**：`GPU_UTIL` 接近 100%，但 `SM_ACTIVE` 明顯更低，`PIPE_TENSOR_ACTIVE` 更低。
+**原本預期**：`GPU_UTIL` 接近 100%，但 `SM_ACTIVE` 明顯更低，`PIPE_TENSOR_ACTIVE` 更低。
+
+**2026-10-20 實測（1 pod、0.42）推翻了一半**：`GPU_UTIL` 99%、`SM_ACTIVE` **0.95**、`PIPE_TENSOR_ACTIVE` **0.52**。SM 並沒有閒著（compute-bound，跟 Phase 2 一致）；落差在 Tensor Core —— 只有一半時間在做矩陣乘法，其餘在跑 attention、逐元素運算、取樣與資料搬移。
 
 **把這三個數字記進 `RESULTS.md`。** 它們之間的差距就是「你以為的利用率」和「真實的利用率」之間的落差。
 

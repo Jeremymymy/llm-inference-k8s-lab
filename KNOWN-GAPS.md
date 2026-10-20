@@ -50,10 +50,11 @@
 
 | 項目 | 解決什麼 | 我會怎麼做 | 為什麼沒做 |
 |---|---|---|---|
-| **MIG** | 真正的硬體隔離，SLA 敏感的多租戶 | `nvidia-smi mig` 切分 + GPU Operator 的 MIG 策略 | **L4 是 Ada 架構，不支援 MIG**（只有 A100/H100/H200 那條線有）。我只做過 time-slicing，能講差異但沒跑過 |
+| **MIG** | 真正的硬體隔離，SLA 敏感的多租戶 | `nvidia-smi mig` 切分 + GPU Operator 的 MIG 策略 | **L4 是 Ada 架構，不支援 MIG**（只有 A100/H100/H200 那條線有；Phase 3 節點標籤 `nvidia.com/mig.capable=false`、`mps.capable=false`）。我只做過 time-slicing，能講差異但沒跑過 |
 | **MPS** | 記憶體軟上限，比 time-slicing 好一點的隔離 | CUDA MPS daemon + device plugin 設定 | 同上，且效益介於兩者之間、複雜度不低 |
 | **多 GPU 節點的排程** | 真實的排程決策（有得選才叫排程） | node affinity + GPU 型號標籤 | 只有一台機器一張卡 |
 | **NVLink / GPUDirect** | 跨卡通訊頻寬 | 拓撲感知排程 | 需要多卡 |
+| **HPA 接 vLLM 指標實跑** | 依排隊長度自動擴容 GPU pod | prometheus-adapter 把 `vllm:num_requests_waiting` 映射成 `pricer_requests_waiting`（設計已完成，HPA YAML 不用改）；`maxReplicas` 壓到 2，門檻用 30 req/s 轉折點時的穩態排隊長度校正 | **HPA 接 vLLM 指標只做到設計，未在 GPU 上實跑**：Phase 3 精簡路線跳過 Part 9（同一套 stack 在 Phase 0 已實跑），`hpa.yaml` 的 `averageValue: "2"` 也沒有實測依據 |
 
 ---
 
