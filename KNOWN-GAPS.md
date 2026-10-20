@@ -29,7 +29,7 @@
 - **etcd 備份還原**：`etcdctl snapshot save` 排程 + 定期演練還原（**沒演練過的備份等於沒有備份**）
 - **容量規劃**：用 DCGM 的歷史利用率推估
 
-**為什麼這次沒做**：一個月的 lab 產不出「跑了三個月」的經驗。**但我做了四份事故報告**（見 [`POSTMORTEMS.md`](POSTMORTEMS.md)）來補這一塊 —— 那是我能在短時間內產出的最接近 day-2 的東西。
+**為什麼這次沒做**：一個月的 lab 產不出「跑了三個月」的經驗。**但我做了四份事故演練紀錄**（見 detail 分支的 [`POSTMORTEMS.md`](https://github.com/Jeremymymy/llm-inference-k8s-lab/blob/detail/POSTMORTEMS.md)；終端輸出為事後重建）來補這一塊 —— 那是我能在短時間內產出的最接近 day-2 的東西。
 
 ---
 
@@ -124,7 +124,7 @@
 
 **解決什麼**：雲端託管 k8s 的實際操作經驗。
 
-**我會怎麼做**：見 [`docs/07-phase4-eks.md`](docs/07-phase4-eks.md) 的附錄。
+**我會怎麼做**：見 detail 分支的 [`docs/07-phase4-eks.md`](https://github.com/Jeremymymy/llm-inference-k8s-lab/blob/detail/docs/07-phase4-eks.md) 的附錄。
 
 **為什麼沒做（或延後）**：目標是 on-prem 職缺，EKS 獨有的東西（IRSA、Karpenter、ALB controller）在地端都不存在。**我做了雲端↔地端的對照表**，那對這個目標來說價值更高，而且省掉每月 $73 的控制平面租金。
 

@@ -19,7 +19,18 @@
 | 不知道它有沒有在飽和 | Prometheus + Grafana + 依佇列長度擴縮的 HPA |
 | 「跑起來就好」 | **每次調校都同時量正確性（MAE）與效能** |
 
-**最後一列是這個 lab 的核心。** 因為這個任務有公開的 baseline（MAE $39.85），所以每個設定變更都有客觀對錯 —— 這讓我抓到一個「服務完全正常但答案是錯的」的設定問題，那是任何 health check 都抓不到的。
+**最後一列是這個 lab 的核心。** 因為這個任務有公開的 baseline（MAE $39.85），所以每個設定變更都有客觀對錯。實測：請求的 model 名稱打到 base 時，服務完全正常、probe 全綠、API 回傳合法的價格，但 MAE 從 $40.74 變成 $200.29 —— 任何 health check 都抓不到。
+
+---
+
+## 亮點（全部是實測數字，g6.xlarge / NVIDIA L4）
+
+- **k8s 這層沒有改變模型行為**：同一個模型搬進 k3s，MAE $40.79，Docker 版 $40.74（差 0.1%，屬批次雜訊）
+- **吞吐翻倍、品質不降**：LoRA 合併進權重 35.77 → 53.38 req/s（+49%），再做 FP8 量化 → 73.28 req/s（+37%）；MAE $40.80 → $40.15
+- **把 GPU time-slicing 的代價拆開**：2 pod 合計吞吐 −19%；加一組對照實驗拆出「顯存切小、KV 變少」佔 10.7%、「兩個 pod 輪流用 GPU」佔 8.8%
+- **「GPU 使用率 100%」只說對一半**：DCGM 量到 SM 忙碌 95%，但 Tensor Core 只有 52% 的時間在算
+- **單卡滾動更新的真實停機 191 秒**：量化「要不要多買一張卡」的決策依據
+- **GPU 總花費約 $6**：k8s 的部分全在本機零成本完成，只有需要 GPU 的實驗才租雲端
 
 ---
 
@@ -55,7 +66,7 @@
 
 ## 成果
 
-> 做到哪裡就填到哪裡。**沒量過的不要填。** 完整紀錄在 [`RESULTS.md`](RESULTS.md)。
+> 完整紀錄（含量測條件、原始數字與結論）在 [`RESULTS.md`](RESULTS.md)。
 
 ### 正確性（MAE，越低越好）
 
@@ -67,7 +78,6 @@
 | llama.cpp Q8_0 + LoRA（Mac） | $40.79 | Phase 0 |
 | vLLM bf16 + LoRA rank 256 | $40.74 | Phase 1 主線 |
 | 同上，跑在 k3s 裡 | $40.79 | Phase 3；與主線一致 → k8s 這層沒改變行為 |
-| vLLM bf16 + **預設 rank 16** | — | 刻意重現的大聲失敗（啟動即拒絕；精簡路線未實跑） |
 | vLLM bf16 + merged 權重 | $40.80 | 與主線一致 |
 | vLLM FP8 + merged 權重 | $40.15 | 沒有可量到的量化代價 |
 
@@ -88,39 +98,25 @@
 | 階段 | 花費 |
 |---|---|
 | Phase 0 + 0.5（本機） | $0 |
-| Phase 1–2（GPU） | — |
+| Phase 1–2（GPU，約 3.5 小時） | 約 $3（依 log 時間戳估算） |
 | Phase 3（GPU，約 3.5 小時） | 約 $2.8（不含 EBS） |
 
 ---
 
-## 進度
+## 做了什麼
 
-- [x] **Phase 0** — 本機 k8s 骨架與可觀測性（$0）
-- [x] **Phase 0.5** — kind 三節點：排程、drain/PDB、資源治理（$0）
-- [x] **Phase 1** — 雲端 GPU + vLLM 服務化與正確性驗證（精簡路線，2026-10-18）
-- [x] **Phase 2** — 效能調校、壓測、量化對照（精簡路線，2026-10-18）
-- [x] **Phase 3** — k3s + GPU + time-slicing + DCGM（精簡路線，2026-10-20；HPA 未在 GPU 上實跑）
-- [ ] **Phase 4** — EKS 雲端↔地端對照（選作）
+- **Phase 0** — 本機 k8s 骨架與可觀測性：probe 分工、Prometheus + prometheus-adapter + 依佇列長度的 HPA（$0）
+- **Phase 0.5** — kind 三節點：排程、drain/PDB、ResourceQuota、PriorityClass 搶佔（$0）
+- **Phase 1** — 雲端 GPU + vLLM 服務化與正確性驗證（2026-10-18）
+- **Phase 2** — 效能調校、壓測、量化對照（2026-10-18）
+- **Phase 3** — k3s + GPU Operator + time-slicing + DCGM（2026-10-20；HPA 接 vLLM 指標未在 GPU 上實跑，見 [`KNOWN-GAPS.md`](KNOWN-GAPS.md)）
+- **Phase 4** — EKS：未實跑，只做了雲端↔地端對照表
 
 ---
 
-## 文件導覽
+## 完整過程
 
-| 文件 | 內容 |
-|---|---|
-| [`docs/00-concepts.md`](docs/00-concepts.md) | LLM 推論原理與術語 —— 面試前複習用 |
-| [`docs/01-setup.md`](docs/01-setup.md) | 前置作業。**AWS 配額申請要最先送出** |
-| [`docs/02-phase0-local-k8s.md`](docs/02-phase0-local-k8s.md) | Phase 0：本機 k8s 骨架、可觀測性、三個故障演練 |
-| [`docs/03-phase0.5-multinode.md`](docs/03-phase0.5-multinode.md) | Phase 0.5：kind 三節點 |
-| [`docs/04-phase1-vllm-gpu.md`](docs/04-phase1-vllm-gpu.md) | Phase 1：雲端 GPU + vLLM |
-| [`docs/05-phase2-tuning.md`](docs/05-phase2-tuning.md) | Phase 2：效能調校與壓測 |
-| [`docs/06-phase3-k3s-gpu.md`](docs/06-phase3-k3s-gpu.md) | Phase 3：GPU 上的 k8s |
-| [`docs/07-phase4-eks.md`](docs/07-phase4-eks.md) | Phase 4：EKS 對照表（選作） |
-| [`docs/90-troubleshooting.md`](docs/90-troubleshooting.md) | 症狀 → 原因 → 解法速查 |
-| [`docs/91-cost-and-teardown.md`](docs/91-cost-and-teardown.md) | 離桌檢查清單、避免帳單失控 |
-| [`docs/92-project-narrative.md`](docs/92-project-narrative.md) | 專案敘事與常見問答 |
-| [`POSTMORTEMS.md`](POSTMORTEMS.md) | 刻意製造的故障與排查紀錄 |
-| [`KNOWN-GAPS.md`](KNOWN-GAPS.md) | 誠實的邊界清單 |
+每個 Phase 的逐步紀錄、排錯速查、事故演練、EKS 對照表，都在 [**detail 分支**](https://github.com/Jeremymymy/llm-inference-k8s-lab/tree/detail)。
 
 ---
 
@@ -137,8 +133,7 @@
 │   ├── observability/         ServiceMonitor、HPA、prometheus-adapter
 │   └── kind/                  三節點叢集設定
 ├── src/pricer-api/            對外門面（FastAPI）
-├── eval/measure.py            評估工具：MAE / R² / hit rate / 延遲百分位
-└── docs/
+└── eval/measure.py            評估工具：MAE / R² / hit rate / 延遲百分位
 ```
 
 **換成自己微調的模型**：只改 `k8s/base/model.conf` 的 `ADAPTER_REPO` 與 `ADAPTER_REVISION`。其他檔案一行都不用動。
@@ -167,8 +162,8 @@ Taking a QLoRA fine-tuned product-pricing model from "runs in a notebook" to "op
 
 No local NVIDIA GPU, so the work splits in two: **all Kubernetes work is done locally at zero cost** (single-node OrbStack for the service skeleton and observability; a three-node kind cluster for scheduling, drain/PDB, and resource governance), and **only the parts that genuinely need a GPU** run on a rented `g6.xlarge` (NVIDIA L4) — vLLM serving, performance tuning, and finally k3s to bring both halves together.
 
-The organising principle: **every experiment measures correctness (MAE) alongside performance.** The task has a published baseline of $39.85 MAE, so every configuration change has an objective pass/fail. That caught a misconfiguration where the service was fully healthy — probes green, API returning well-formed prices — but silently wrong, which no health check could detect.
+The organising principle: **every experiment measures correctness (MAE) alongside performance.** The task has a published baseline of $39.85 MAE, so every configuration change has an objective pass/fail. Measured: when requests hit the base model instead of the adapter, the service stays fully healthy — probes green, API returning well-formed prices — yet MAE jumps from $40.74 to $200.29, which no health check can detect.
 
-Deliberately **not** EKS-first: GPU-on-Kubernetes fundamentals are fully learnable on single-node k3s, which is also closer to the on-prem target environment, and it avoids the $73/month control-plane rent. A cloud↔on-prem mapping table is in [`docs/07-phase4-eks.md`](docs/07-phase4-eks.md).
+Deliberately **not** EKS-first: GPU-on-Kubernetes fundamentals are fully learnable on single-node k3s, which is also closer to the on-prem target environment, and it avoids the $73/month control-plane rent. A cloud↔on-prem mapping table is on the [detail branch](https://github.com/Jeremymymy/llm-inference-k8s-lab/blob/detail/docs/07-phase4-eks.md).
 
 Model, dataset and baseline come from [Ed Donner's LLM Engineering course](https://github.com/ed-donner/llm_engineering) — see Attribution above. The deployment and operations work is mine.
