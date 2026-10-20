@@ -545,7 +545,7 @@ docker exec vllm vllm bench serve ...
 
 ## 這一階段該產出的一句話
 
-在 `92-interview.md` 裡補上這段（2026-10-18 實測數字）：
+在 `92-project-narrative.md` 裡補上這段（2026-10-18 實測數字）：
 
 > 「我的 workload 是 prefill 主導的（輸入 150 token、輸出 5 token）。很多人以為 `--max-model-len` 是最大的槓桿，我實測的結果是：預設的 131072 在 L4 上根本起不來（一條序列的 KV cache 就要 14GB，可用只有 9GB），但能起來的 32768 和 512 兩組吞吐只差 0.4% —— 因為 vLLM 的 KV cache 是按需分配的，max-model-len 不會預留空間，它只影響啟動檢查和『最大並發』那行最壞情況的估計。真正的瓶頸是算力：壓測時 GPU util 100%、KV cache 使用率只有 13%，但佇列排到 430。所以加大 `--max-num-batched-tokens` 吞吐也不變，只讓 TPOT 變慢 2.8 倍。真正有效的是減少計算：把 LoRA merge 進去吞吐 +49%，再做 FP8 又 +37%，MAE 都沒變 —— FP8 有效是因為 L4 上 vLLM 用的是 W8A8 的 CUTLASS kernel，連運算都是 FP8，不只是省頻寬。另外我差點被 prefix cache 騙：壓測同一個 seed 重跑，吞吐從 36 跳到 258 req/s。」
 

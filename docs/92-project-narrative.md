@@ -1,4 +1,4 @@
-# LLM Inference on Kubernetes 實驗室 — 92：面試敘事與追問應答
+# LLM Inference on Kubernetes 實驗室 — 92：專案敘事與常見問答
 
 > 這一份要**邊做邊填**。每做完一個 Phase 就回來把問號換成你的實際數字。
 > **沒有被你量過的東西，不要寫進來。** 追問兩層就會露餡，而且比不會更糟。

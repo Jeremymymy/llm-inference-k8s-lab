@@ -118,7 +118,7 @@
 | [`docs/07-phase4-eks.md`](docs/07-phase4-eks.md) | Phase 4：EKS 對照表（選作） |
 | [`docs/90-troubleshooting.md`](docs/90-troubleshooting.md) | 症狀 → 原因 → 解法速查 |
 | [`docs/91-cost-and-teardown.md`](docs/91-cost-and-teardown.md) | 離桌檢查清單、避免帳單失控 |
-| [`docs/92-interview.md`](docs/92-interview.md) | 面試敘事與追問應答 |
+| [`docs/92-project-narrative.md`](docs/92-project-narrative.md) | 專案敘事與常見問答 |
 | [`POSTMORTEMS.md`](POSTMORTEMS.md) | 刻意製造的故障與排查紀錄 |
 | [`KNOWN-GAPS.md`](KNOWN-GAPS.md) | 誠實的邊界清單 |
 

@@ -160,6 +160,6 @@ aws ec2 describe-addresses --region us-east-1 \
 
 ## 這一階段該產出的一句話
 
-在 `92-interview.md` 補上：
+在 `92-project-narrative.md` 補上：
 
 > 「我刻意沒有把 EKS 當主線 —— 我要做的是地端平台，而 GPU + k8s 的核心知識在單機 k3s 上完全學得到，還省掉每月 $73 的控制平面租金。我整理了一份雲端↔地端的對照表：IRSA 對應到 ServiceAccount 加外部 secret 管理、ALB controller 對應到 MetalLB 加 ingress、EBS CSI 對應到 local PV。最關鍵的一格是 Karpenter —— 地端沒有對應物，因為容量是固定的，這也是為什麼地端平台的重心在資源治理和利用率，而不是彈性擴縮。」
