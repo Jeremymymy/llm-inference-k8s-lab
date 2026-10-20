@@ -843,17 +843,19 @@ helm rollback gpu-operator 1 -n gpu-operator        # 回滾
 
 ## Phase 3 驗收清單
 
-- [ ] `kubectl get runtimeclass` 看得到 `nvidia`
-- [ ] `kubectl describe node` 的 Capacity 有 `nvidia.com/gpu`
-- [ ] `kubectl exec deploy/model-server -- nvidia-smi` 在 pod 裡看得到卡
-- [ ] **MAE 跟 Phase 1 的 Docker 版一致**（證明 k8s 這層沒改變行為）
-- [ ] 單卡下的 rollout 死結重現過，且量了選項 A 的停機時間
-- [ ] time-slicing 生效，`nvidia.com/gpu: 3` 出現在節點容量
-- [ ] **「1 pod vs 2 pod」的吞吐 / p99 / MAE 對照表完成**，並親眼看過第 3 個 pod 排程成功、卻因顯存不夠起不來
-- [ ] **DCGM 的 `GPU_UTIL` vs `SM_ACTIVE` vs `PIPE_TENSOR_ACTIVE` 三個數字都記錄了**
-- [ ] HPA 用 `vllm:num_requests_waiting` 實際擴容（`SuccessfulRescale`）
-- [ ] HPA 門檻已用 Phase 2 的曲線校正過
-- [ ] 所有數字進了 `RESULTS.md`
+2026-10-20 精簡路線實跑結果（未勾的是精簡路線刻意跳過的，見 `KNOWN-GAPS.md`）：
+
+- [x] `kubectl get runtimeclass` 看得到 `nvidia`
+- [x] `kubectl describe node` 的 Capacity 有 `nvidia.com/gpu`
+- [x] `kubectl exec deploy/model-server -- nvidia-smi` 在 pod 裡看得到卡
+- [x] **MAE 跟 Phase 1 的 Docker 版一致**（證明 k8s 這層沒改變行為）—— $40.79 vs $40.74
+- [x] 單卡下的 rollout 死結重現過，且量了選項 A 的停機時間 —— 191 秒
+- [x] time-slicing 生效，`nvidia.com/gpu: 3` 出現在節點容量
+- [x] **「1 pod vs 2 pod」的吞吐 / p99 / MAE 對照表完成**（另加 1 pod 0.42 對照組）；第 3 個 pod CrashLoop 示範精簡路線未做（📖 讀就好）
+- [x] **DCGM 的 `GPU_UTIL` vs `SM_ACTIVE` vs `PIPE_TENSOR_ACTIVE` 三個數字都記錄了** —— 99% / 0.95 / 0.52
+- [ ] HPA 用 `vllm:num_requests_waiting` 實際擴容（`SuccessfulRescale`）—— 精簡路線跳過
+- [ ] HPA 門檻已用 Phase 2 的曲線校正過 —— 精簡路線跳過
+- [x] 所有數字進了 `RESULTS.md`
 
 ---
 
